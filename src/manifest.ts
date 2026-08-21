@@ -47,28 +47,24 @@ const manifest: PaperclipPluginManifestV1 = {
     type: "object",
     properties: {
       slackTokenRef: {
-        type: "string",
         format: "secret-ref",
         title: "Slack Bot Token (secret reference)",
         description: "Secret UUID for your Slack Bot OAuth token. Create the secret in Settings → Secrets, then paste its UUID here.",
         default: DEFAULT_CONFIG.slackTokenRef,
       },
       slackSigningSecretRef: {
-        type: "string",
         format: "secret-ref",
         title: "Slack Signing Secret (secret reference)",
         description: "Secret UUID for your Slack app's Signing Secret. Required to verify that incoming webhooks are genuinely from Slack.",
         default: DEFAULT_CONFIG.slackSigningSecretRef,
       },
       slackAppTokenRef: {
-        type: "string",
         format: "secret-ref",
         title: "Slack App Token (secret reference)",
         description: "Secret UUID for a Slack app-level token with connections:write, used for Socket Mode.",
         default: DEFAULT_CONFIG.slackAppTokenRef,
       },
       paperclipApiKeyRef: {
-        type: "string",
         format: "secret-ref",
         title: "Paperclip Board API Key (secret reference)",
         description: "Secret UUID for a company-scoped board API key used to relay Slack replies as the paired human.",
