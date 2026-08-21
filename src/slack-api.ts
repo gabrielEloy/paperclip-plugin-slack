@@ -16,6 +16,7 @@ export interface SlackMessage {
 const SLACK_API_BASE = "https://slack.com/api";
 const MAX_RETRIES = 3;
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503]);
+const openedDmChannels = new Map<string, string>();
 
 async function fetchWithRetry(
   ctx: PluginContext,
@@ -47,8 +48,37 @@ export async function postMessage(
   message: SlackMessage,
   opts?: { threadTs?: string },
 ): Promise<{ ok: boolean; ts?: string; channel?: string; error?: string }> {
+  let resolvedChannelId = channelId;
+  if (channelId.startsWith("U")) {
+    const cached = openedDmChannels.get(channelId);
+    if (cached) {
+      resolvedChannelId = cached;
+    } else {
+      const openResponse = await fetchWithRetry(ctx, `${SLACK_API_BASE}/conversations.open`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ users: channelId }),
+      });
+      const openBody = await openResponse.json() as {
+        ok: boolean;
+        channel?: { id?: string };
+        error?: string;
+      };
+      const dmChannelId = openBody.channel?.id;
+      if (!openBody.ok || !dmChannelId) {
+        ctx.logger.warn("Slack conversations.open failed", { error: openBody.error, userId: channelId });
+        return { ok: false, error: openBody.error ?? "dm_open_failed" };
+      }
+      openedDmChannels.set(channelId, dmChannelId);
+      resolvedChannelId = dmChannelId;
+    }
+  }
+
   const payload: Record<string, unknown> = {
-    channel: channelId,
+    channel: resolvedChannelId,
     text: message.text,
     blocks: message.blocks,
   };
@@ -68,7 +98,7 @@ export async function postMessage(
   const body = await response.json() as { ok: boolean; ts?: string; channel?: string; error?: string };
 
   if (!body.ok) {
-    ctx.logger.warn("Slack API error", { error: body.error, channelId });
+    ctx.logger.warn("Slack API error", { error: body.error, channelId: resolvedChannelId });
   }
 
   return body;
