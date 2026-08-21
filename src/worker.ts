@@ -193,7 +193,7 @@ async function handleSlackEventCallback(
   const files = Array.isArray(event.files) ? event.files as Array<Record<string, unknown>> : [];
   if (!channel || !threadTs || (!text && files.length === 0)) return;
 
-  const config = (await ctx.config.get()) as unknown as SlackConfig;
+  const config = (await ctx.config.get(companyId)) as unknown as SlackConfig;
   if (config.slackUserId && userId !== config.slackUserId) {
     ctx.logger.warn("Ignoring Slack thread reply from an unauthorized user", { userId, channel });
     return;
@@ -472,13 +472,19 @@ async function handleApproveCommand(ctx: PluginContext, responseUrl: string, app
 
 const plugin = definePlugin({
   async setup(ctx) {
-    const rawConfig = await ctx.config.get();
+    const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+    const bootstrapCompanyId = companies[0]?.id ?? "";
+    if (!bootstrapCompanyId) {
+      ctx.logger.warn("No company is available; Slack plugin runtime disabled");
+      return;
+    }
+    const rawConfig = await ctx.config.get(bootstrapCompanyId);
     const config = rawConfig as unknown as SlackConfig;
     // Always reads the current persisted config so flag changes (e.g.
     // toggling notifyOnAgentConnected) take effect without restarting the
     // plugin worker.
-    const getConfig = async (): Promise<SlackConfig> =>
-      (await ctx.config.get()) as unknown as SlackConfig;
+    const getConfig = async (companyId = bootstrapCompanyId): Promise<SlackConfig> =>
+      (await ctx.config.get(companyId)) as unknown as SlackConfig;
 
     pluginCtx = ctx;
     pluginConfig = config;
@@ -492,7 +498,7 @@ const plugin = definePlugin({
       return;
     }
 
-    const token = await resolveStartupSlackToken(ctx, config.slackTokenRef, (health) => {
+    const token = await resolveStartupSlackToken(ctx, config.slackTokenRef, bootstrapCompanyId, (health) => {
       runtimeHealth = health;
     });
     if (!token) {
@@ -504,7 +510,10 @@ const plugin = definePlugin({
     // Resolve Slack signing secret for webhook signature verification
     if (config.slackSigningSecretRef) {
       try {
-        slackSigningSecret = await ctx.secrets.resolve(config.slackSigningSecretRef);
+        slackSigningSecret = await ctx.secrets.resolve(config.slackSigningSecretRef, {
+          companyId: bootstrapCompanyId,
+          configPath: "slackSigningSecretRef",
+        });
       } catch {
         ctx.logger.warn("Slack signing secret not configured — webhook signature verification disabled");
       }
@@ -512,7 +521,10 @@ const plugin = definePlugin({
 
     if (config.slackAppTokenRef) {
       try {
-        const appToken = await ctx.secrets.resolve(config.slackAppTokenRef);
+        const appToken = await ctx.secrets.resolve(config.slackAppTokenRef, {
+          companyId: bootstrapCompanyId,
+          configPath: "slackAppTokenRef",
+        });
         socketModeClient = new SlackSocketModeClient(ctx, appToken, handleSocketEnvelope);
         await socketModeClient.start();
       } catch (err) {

@@ -11,10 +11,11 @@ export const SECRET_RESOLUTION_ISSUE_URL = "https://github.com/mvanhorn/papercli
 export async function resolveStartupSlackToken(
   ctx: PluginContext,
   tokenRef: string,
+  companyId: string,
   setHealth: (health: SlackRuntimeHealth) => void,
 ): Promise<string | undefined> {
   try {
-    const token = await ctx.secrets.resolve(tokenRef);
+    const token = await ctx.secrets.resolve(tokenRef, { companyId, configPath: "slackTokenRef" });
     setHealth({ status: "ok" });
     return token;
   } catch (err) {

@@ -21,7 +21,7 @@ describe("resolveStartupSlackToken", () => {
     const health: SlackRuntimeHealth[] = [];
     const ctx = makeContext(async () => "xoxb-token");
 
-    const token = await resolveStartupSlackToken(ctx, "secret-ref", (next) => health.push(next));
+    const token = await resolveStartupSlackToken(ctx, "secret-ref", "company-1", (next) => health.push(next));
 
     expect(token).toBe("xoxb-token");
     expect(health).toEqual([{ status: "ok" }]);
@@ -33,7 +33,7 @@ describe("resolveStartupSlackToken", () => {
       throw new Error(SECRET_RESOLUTION_DISABLED_MESSAGE);
     });
 
-    const token = await resolveStartupSlackToken(ctx, "secret-ref", (next) => health.push(next));
+    const token = await resolveStartupSlackToken(ctx, "secret-ref", "company-1", (next) => health.push(next));
 
     expect(token).toBeUndefined();
     expect(health).toEqual([{
