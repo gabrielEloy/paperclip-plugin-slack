@@ -42,6 +42,7 @@ export const DEFAULT_CONFIG = {
   slackTokenRef: "",
   slackSigningSecretRef: "",
   slackAppTokenRef: "",
+  paperclipApiKeyRef: "",
   slackUserId: "",
   paperclipUserId: "",
   defaultChannelId: "",

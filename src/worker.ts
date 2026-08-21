@@ -7,7 +7,7 @@ import {
   type PluginWebhookInput,
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
-import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID } from "./constants.js";
+import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID, DEFAULT_CONFIG } from "./constants.js";
 import { postMessage, respondToAction, respondEphemeral } from "./slack-api.js";
 import type { SlackMessage } from "./slack-api.js";
 import type { SlackConfig, EscalationRecord, CommandDefinition, SessionEntry } from "./types.js";
@@ -60,6 +60,10 @@ let pluginConfig: SlackConfig;
 let slackAdapter: SlackAdapter;
 let runtimeHealth: SlackRuntimeHealth = { status: "ok" };
 let socketModeClient: SlackSocketModeClient | null = null;
+let paperclipApiKey = "";
+let applyRuntimeConfig: ((config: SlackConfig, companyId: string) => Promise<void>) | null = null;
+const issueBySlackThread = new Map<string, string>();
+const handledSlackEvents = new Set<string>();
 
 // --- Slack signature verification ---
 
@@ -153,30 +157,21 @@ async function handleSlackEventCallback(
 ): Promise<void> {
   if (body.type !== "event_callback") return;
 
-  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
-  const companyId = companies[0]?.id ?? "";
-  if (!companyId) return;
-
   const eventId = String(body.event_id ?? "");
+  if (eventId && handledSlackEvents.has(eventId)) return;
   if (eventId) {
-    const eventKey = STATE_KEYS.slackEvent(eventId);
-    const alreadyHandled = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: eventKey });
-    if (alreadyHandled) return;
-    await ctx.state.set(
-      { scopeKind: "company", scopeId: companyId, stateKey: eventKey },
-      new Date().toISOString(),
-    );
+    handledSlackEvents.add(eventId);
+    if (handledSlackEvents.size > 1_000) {
+      const oldest = handledSlackEvents.values().next().value;
+      if (oldest) handledSlackEvents.delete(oldest);
+    }
   }
 
   const event = body.event as Record<string, unknown> | undefined;
   if (!event) return;
 
   if (event.type === "file_shared") {
-    const fileId = String(event.file_id ?? "");
-    const channelId = String(event.channel_id ?? "");
-    if (fileId && channelId) {
-      await processMediaFile(ctx, pluginToken, companyId, fileId, channelId, "");
-    }
+    ctx.logger.info("Ignoring standalone Slack file event in issue bridge mode");
     return;
   }
 
@@ -193,36 +188,48 @@ async function handleSlackEventCallback(
   const files = Array.isArray(event.files) ? event.files as Array<Record<string, unknown>> : [];
   if (!channel || !threadTs || (!text && files.length === 0)) return;
 
-  const config = (await ctx.config.get(companyId)) as unknown as SlackConfig;
+  const config = pluginConfig;
   if (config.slackUserId && userId !== config.slackUserId) {
     ctx.logger.warn("Ignoring Slack thread reply from an unauthorized user", { userId, channel });
     return;
   }
 
-  const issueId = await ctx.state.get({
-    scopeKind: "company",
-    scopeId: companyId,
-    stateKey: STATE_KEYS.issueForThread(channel, threadTs),
-  }) as string | null;
-
-  if (issueId && text) {
-    if (!config.paperclipUserId) {
-      ctx.logger.warn("Cannot relay Slack reply: paperclipUserId is not configured", { issueId });
-      return;
-    }
-    await ctx.issues.createComment(issueId, text, companyId, {
-      actorUserId: config.paperclipUserId,
-    });
-    await ctx.metrics.write("slack.issue_replies.received", 1);
-    return;
+  let issueId = issueBySlackThread.get(`${channel}:${threadTs}`) ?? null;
+  if (!issueId) {
+    const response = await ctx.http.fetch(
+      `https://slack.com/api/conversations.replies?channel=${encodeURIComponent(channel)}&ts=${encodeURIComponent(threadTs)}&limit=1`,
+      { headers: { Authorization: `Bearer ${pluginToken}` } },
+    );
+    const history = await response.json() as { ok?: boolean; messages?: Array<Record<string, unknown>> };
+    const root = history.messages?.[0];
+    const serialized = JSON.stringify(root ?? {});
+    const match = serialized.match(/\/issues\/([0-9a-f]{8}-[0-9a-f-]{27,})/i);
+    issueId = match?.[1] ?? null;
+    if (issueId) issueBySlackThread.set(`${channel}:${threadTs}`, issueId);
   }
 
-  await ctx.events.emit("plugin.slack.thread_message", companyId, {
+  if (issueId && text) {
+    if (!paperclipApiKey || !config.paperclipBaseUrl) {
+      ctx.logger.warn("Cannot relay Slack reply: Paperclip API credentials are not configured", { issueId });
+      return;
+    }
+    const response = await ctx.http.fetch(`${config.paperclipBaseUrl}/api/issues/${issueId}/comments`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${paperclipApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ body: text }),
+    });
+    if (!response.ok) {
+      throw new Error(`Paperclip comment relay failed with HTTP ${response.status}`);
+    }
+    return;
+  }
+  ctx.logger.warn("Ignoring Slack reply because its thread is not linked to a Paperclip issue", {
     channel,
     threadTs,
-    text,
-    replyToMessageTs: messageTs,
-    files,
+    messageTs,
   });
 }
 
@@ -472,70 +479,53 @@ async function handleApproveCommand(ctx: PluginContext, responseUrl: string, app
 
 const plugin = definePlugin({
   async setup(ctx) {
-    const companies = await ctx.companies.list({ limit: 1, offset: 0 });
-    const bootstrapCompanyId = companies[0]?.id ?? "";
-    if (!bootstrapCompanyId) {
-      ctx.logger.warn("No company is available; Slack plugin runtime disabled");
-      return;
-    }
-    const rawConfig = await ctx.config.get(bootstrapCompanyId);
-    const config = rawConfig as unknown as SlackConfig;
+    const config = { ...DEFAULT_CONFIG } as SlackConfig;
+    let token = "";
     // Always reads the current persisted config so flag changes (e.g.
     // toggling notifyOnAgentConnected) take effect without restarting the
     // plugin worker.
-    const getConfig = async (companyId = bootstrapCompanyId): Promise<SlackConfig> =>
+    const getConfig = async (companyId: string): Promise<SlackConfig> =>
       (await ctx.config.get(companyId)) as unknown as SlackConfig;
 
     pluginCtx = ctx;
     pluginConfig = config;
+    runtimeHealth = { status: "degraded", message: "Slack bridge is not configured" };
 
-    if (config.paperclipBaseUrl) {
-      setBaseUrl(config.paperclipBaseUrl);
-    }
+    applyRuntimeConfig = async (nextConfig, companyId) => {
+      pluginConfig = nextConfig;
+      if (nextConfig.paperclipBaseUrl) setBaseUrl(nextConfig.paperclipBaseUrl);
 
-    if (!config.slackTokenRef) {
-      ctx.logger.warn("No slackTokenRef configured, notifications disabled");
-      return;
-    }
+      const resolvedToken = await resolveStartupSlackToken(
+        ctx,
+        nextConfig.slackTokenRef,
+        companyId,
+        (health) => { runtimeHealth = health; },
+      );
+      if (!resolvedToken) return;
+      token = resolvedToken;
+      pluginToken = resolvedToken;
+      slackAdapter = new SlackAdapter(ctx, resolvedToken);
 
-    const token = await resolveStartupSlackToken(ctx, config.slackTokenRef, bootstrapCompanyId, (health) => {
-      runtimeHealth = health;
-    });
-    if (!token) {
-      ctx.logger.warn("Slack plugin runtime disabled because Slack token could not be resolved");
-      return;
-    }
-    pluginToken = token;
-
-    // Resolve Slack signing secret for webhook signature verification
-    if (config.slackSigningSecretRef) {
-      try {
-        slackSigningSecret = await ctx.secrets.resolve(config.slackSigningSecretRef, {
-          companyId: bootstrapCompanyId,
+      if (nextConfig.slackSigningSecretRef) {
+        slackSigningSecret = await ctx.secrets.resolve(nextConfig.slackSigningSecretRef, {
+          companyId,
           configPath: "slackSigningSecretRef",
         });
-      } catch {
-        ctx.logger.warn("Slack signing secret not configured — webhook signature verification disabled");
       }
-    }
 
-    if (config.slackAppTokenRef) {
-      try {
-        const appToken = await ctx.secrets.resolve(config.slackAppTokenRef, {
-          companyId: bootstrapCompanyId,
-          configPath: "slackAppTokenRef",
-        });
-        socketModeClient = new SlackSocketModeClient(ctx, appToken, handleSocketEnvelope);
-        await socketModeClient.start();
-      } catch (err) {
-        runtimeHealth = {
-          status: "degraded",
-          message: "Slack Socket Mode could not start",
-          details: { error: String(err) },
-        };
-        ctx.logger.warn("Slack Socket Mode is unavailable", { error: String(err) });
-      }
-    }
+      paperclipApiKey = await ctx.secrets.resolve(nextConfig.paperclipApiKeyRef, {
+        companyId,
+        configPath: "paperclipApiKeyRef",
+      });
+      const appToken = await ctx.secrets.resolve(nextConfig.slackAppTokenRef, {
+        companyId,
+        configPath: "slackAppTokenRef",
+      });
+      await socketModeClient?.stop();
+      socketModeClient = new SlackSocketModeClient(ctx, appToken, handleSocketEnvelope);
+      await socketModeClient.start();
+      runtimeHealth = { status: "ok" };
+    };
 
     // =========================================================================
     // PHASE 1: Escalation - using 3-arg ctx.tools.register with ToolRunContext
@@ -900,7 +890,8 @@ const plugin = definePlugin({
       overrideChannelId?: string,
       opts?: { threadTs?: string },
     ) => {
-      const fallback = overrideChannelId || config.defaultChannelId;
+      const liveConfig = await getConfig(event.companyId);
+      const fallback = overrideChannelId || liveConfig.defaultChannelId;
       const channelId = await resolveChannel(ctx, event.companyId, fallback);
       if (!channelId) return;
       const result = await postMessage(ctx, token, channelId, formatter(event), opts);
@@ -925,16 +916,17 @@ const plugin = definePlugin({
     // Handlers are always registered so that config changes (e.g. toggling
     // notifyOnAgentConnected) take effect without a plugin restart.
     ctx.events.on("issue.created", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const live = await getConfig(event.companyId);
       if (!live.notifyOnIssueCreated) return;
       const result = await notify(event, formatIssueCreated);
       if (result?.ok && result.ts) {
-        const channelId = result.channel ?? await resolveChannel(ctx, event.companyId, config.defaultChannelId);
+        const channelId = result.channel ?? await resolveChannel(ctx, event.companyId, live.defaultChannelId);
         await ctx.state.set(
           { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.threadIssue(event.entityId ?? "") },
           result.ts,
         );
         if (channelId && event.entityId) {
+          issueBySlackThread.set(`${channelId}:${result.ts}`, event.entityId);
           await ctx.state.set(
             { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.threadIssueChannel(event.entityId) },
             channelId,
@@ -953,7 +945,7 @@ const plugin = definePlugin({
       const commentId = String(payload.commentId ?? "");
       if (!issueId || !commentId) return;
 
-      const live = await getConfig();
+      const live = await getConfig(event.companyId);
       const comments = await ctx.issues.listComments(issueId, event.companyId);
       const comment = comments.find((candidate) => candidate.id === commentId);
       if (!comment || comment.authorUserId === live.paperclipUserId) return;
@@ -981,7 +973,7 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("issue.updated", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const live = await getConfig(event.companyId);
       if (!live.notifyOnIssueDone) return;
       const payload = event.payload as Record<string, unknown>;
       if (payload.status !== "done") return;
@@ -999,19 +991,19 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("approval.created", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const live = await getConfig(event.companyId);
       if (!live.notifyOnApprovalCreated) return;
       await notify(event, formatApprovalCreated, live.approvalsChannelId);
     });
 
     ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const live = await getConfig(event.companyId);
       if (!live.notifyOnAgentError) return;
       await notify(event, formatAgentError, live.errorsChannelId);
     });
 
     ctx.events.on("agent.status_changed", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const live = await getConfig(event.companyId);
       if (!live.notifyOnAgentConnected) return;
       const payload = event.payload as Record<string, unknown>;
       if (payload.status === "active" || payload.status === "online") {
@@ -1020,7 +1012,7 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const live = await getConfig(event.companyId);
       if (!live.notifyOnAgentConnected) return;
       const payload = event.payload as Record<string, unknown>;
       // Dedup on agent id, not run id — event.entityId is the run UUID for
@@ -1050,7 +1042,7 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("cost_event.created", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const live = await getConfig(event.companyId);
       if (!live.notifyOnBudgetThreshold) return;
       const payload = event.payload as Record<string, unknown>;
       const pct = Number(payload.percentUsed ?? 0);
@@ -1442,8 +1434,6 @@ const plugin = definePlugin({
       });
     }
 
-    slackAdapter = new SlackAdapter(ctx, token);
-
     ctx.logger.info("Slack Chat OS plugin started");
   },
 
@@ -1644,6 +1634,9 @@ const plugin = definePlugin({
     if (!config.slackAppTokenRef || typeof config.slackAppTokenRef !== "string") {
       return { ok: false, errors: ["slackAppTokenRef is required for bidirectional Socket Mode"] };
     }
+    if (!config.paperclipApiKeyRef || typeof config.paperclipApiKeyRef !== "string") {
+      return { ok: false, errors: ["paperclipApiKeyRef is required for Slack reply relay"] };
+    }
     if (!config.slackUserId || typeof config.slackUserId !== "string") {
       return { ok: false, errors: ["slackUserId is required"] };
     }
@@ -1656,6 +1649,11 @@ const plugin = definePlugin({
   async onShutdown() {
     await socketModeClient?.stop();
     socketModeClient = null;
+  },
+
+  async onConfigChanged(config, context) {
+    if (!context?.companyId || !applyRuntimeConfig) return;
+    await applyRuntimeConfig(config as unknown as SlackConfig, context.companyId);
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {

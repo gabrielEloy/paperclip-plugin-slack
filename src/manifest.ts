@@ -22,8 +22,6 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.read",
     "issues.create",
     "issue.comments.read",
-    "issue.comments.create",
-    "issue.comments.create_human_attributed",
     "agents.read",
     "agent.sessions.create",
     "agent.sessions.send",
@@ -68,6 +66,13 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Slack App Token (secret reference)",
         description: "Secret UUID for a Slack app-level token with connections:write, used for Socket Mode.",
         default: DEFAULT_CONFIG.slackAppTokenRef,
+      },
+      paperclipApiKeyRef: {
+        type: "string",
+        format: "secret-ref",
+        title: "Paperclip Board API Key (secret reference)",
+        description: "Secret UUID for a company-scoped board API key used to relay Slack replies as the paired human.",
+        default: DEFAULT_CONFIG.paperclipApiKeyRef,
       },
       slackUserId: {
         type: "string",
@@ -178,7 +183,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.maxAgentsPerThread,
       },
     },
-    required: ["slackTokenRef", "slackAppTokenRef", "slackUserId", "paperclipUserId", "defaultChannelId"],
+    required: ["slackTokenRef", "slackAppTokenRef", "paperclipApiKeyRef", "slackUserId", "paperclipUserId", "defaultChannelId"],
   },
   jobs: [
     {

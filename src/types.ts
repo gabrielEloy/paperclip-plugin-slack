@@ -2,6 +2,7 @@ export type SlackConfig = {
   slackTokenRef: string;
   slackSigningSecretRef: string;
   slackAppTokenRef: string;
+  paperclipApiKeyRef: string;
   slackUserId: string;
   paperclipUserId: string;
   defaultChannelId: string;
