@@ -106,6 +106,8 @@ This is that plugin.
 - `/clip status` - Show active agents and recent completions
 - `/clip agents` - List all agents with status badges
 - `/clip issues [open|done]` - List issues filtered by status
+- `/clip bloqueadas` - List all blocked tasks (aliases: `blocked`, `bloqueados`)
+- `/clip revisao` - List all tasks pending review (aliases: `review`, `in_review`)
 - `/clip approve <id>` - Approve a pending approval
 - `/clip acp spawn <agent> [display]` - Add an agent to this thread
 - `/clip acp status` - Show all agents in this thread

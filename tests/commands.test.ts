@@ -1,18 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { encodeSlashCommandPayload, parseSlashCommand } from "../src/slash-command.js";
 
 describe("slash command parsing", () => {
-  function parseSlashCommand(rawBody: string) {
-    const params = new URLSearchParams(rawBody);
-    return {
-      command: params.get("command") ?? "",
-      text: params.get("text") ?? "",
-      responseUrl: params.get("response_url") ?? "",
-      userId: params.get("user_id") ?? "",
-      channelId: params.get("channel_id") ?? "",
-      threadTs: params.get("thread_ts") ?? "",
-    };
-  }
-
   it("parses a status command", () => {
     const raw = "command=%2Fclip&text=status&response_url=https%3A%2F%2Fhooks.slack.com%2Factions&user_id=U123&channel_id=C456";
     const result = parseSlashCommand(raw);
@@ -81,6 +70,30 @@ describe("slash command parsing", () => {
     const raw = "command=%2Fclip&text=watches&response_url=https%3A%2F%2Fhooks.slack.com%2Factions";
     const result = parseSlashCommand(raw);
     expect(result.text).toBe("watches");
+  });
+
+  it.each(["bloqueadas", "blocked", "revisao", "review"]) (
+    "parses the %s queue command",
+    (command) => {
+      const raw = `command=%2Fclip&text=${command}&response_url=https%3A%2F%2Fhooks.slack.com%2Factions&user_id=U123`;
+      expect(parseSlashCommand(raw).text).toBe(command);
+    },
+  );
+
+  it("encodes a Socket Mode slash command payload", () => {
+    const raw = encodeSlashCommandPayload({
+      command: "/clip",
+      text: "revisao",
+      response_url: "https://hooks.slack.com/actions",
+      user_id: "U123",
+      ignored: { nested: true },
+    });
+    expect(parseSlashCommand(raw)).toMatchObject({
+      command: "/clip",
+      text: "revisao",
+      responseUrl: "https://hooks.slack.com/actions",
+      userId: "U123",
+    });
   });
 });
 

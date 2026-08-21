@@ -80,6 +80,8 @@ import {
   type PlanApprovalInteraction,
   type PlanApprovalMessageRef,
 } from "./plan-approval.js";
+import { buildIssueQueueMessage, type IssueQueueStatus } from "./issue-query.js";
+import { encodeSlashCommandPayload, parseSlashCommand } from "./slash-command.js";
 
 let pluginCtx: PluginContext;
 let pluginToken: string;
@@ -144,25 +146,6 @@ async function resolveChannel(
     stateKey: STATE_KEYS.slackChannel,
   });
   return (override as string) ?? fallback ?? null;
-}
-
-function parseSlashCommand(rawBody: string): {
-  command: string;
-  text: string;
-  responseUrl: string;
-  userId: string;
-  channelId: string;
-  threadTs: string;
-} {
-  const params = new URLSearchParams(rawBody);
-  return {
-    command: params.get("command") ?? "",
-    text: params.get("text") ?? "",
-    responseUrl: params.get("response_url") ?? "",
-    userId: params.get("user_id") ?? "",
-    channelId: params.get("channel_id") ?? "",
-    threadTs: params.get("thread_ts") ?? "",
-  };
 }
 
 function statusBadge(status: string): string {
@@ -275,6 +258,10 @@ async function handleSocketEnvelope(envelope: SocketEnvelope): Promise<void> {
   }
   if (envelope.type === "interactive") {
     await handleSlackInteractivePayload(pluginCtx, envelope.payload);
+    return;
+  }
+  if (envelope.type === "slash_commands") {
+    await handleSlashCommand(pluginCtx, encodeSlashCommandPayload(envelope.payload));
   }
 }
 
@@ -600,7 +587,7 @@ async function handleSlackInteractivePayload(
 // --- Slash command routing ---
 
 async function handleSlashCommand(ctx: PluginContext, rawBody: string): Promise<void> {
-  const { text, responseUrl, channelId, threadTs } = parseSlashCommand(rawBody);
+  const { text, responseUrl, userId, channelId, threadTs } = parseSlashCommand(rawBody);
   const parts = text.trim().split(/\s+/);
   const subcommand = parts[0]?.toLowerCase() ?? "";
   const arg = parts[1]?.toLowerCase() ?? "";
@@ -622,6 +609,17 @@ async function handleSlashCommand(ctx: PluginContext, rawBody: string): Promise<
         break;
       case "issues":
         await handleIssuesCommand(ctx, companyId, responseUrl, arg);
+        break;
+      case "blocked":
+      case "bloqueadas":
+      case "bloqueados":
+        await handleIssueQueueCommand(ctx, companyId, responseUrl, userId, "blocked");
+        break;
+      case "review":
+      case "revisao":
+      case "revisão":
+      case "in_review":
+        await handleIssueQueueCommand(ctx, companyId, responseUrl, userId, "in_review");
         break;
       case "approve":
         await handleApproveCommand(ctx, responseUrl, arg);
@@ -737,6 +735,8 @@ async function handleHelpCommand(ctx: PluginContext, responseUrl: string): Promi
             "`/clip status` - Show active agents and recent completions",
             "`/clip agents` - List all agents with status badges",
             "`/clip issues [open|done]` - List issues filtered by status",
+            "`/clip bloqueadas` - Lista todas as tasks bloqueadas",
+            "`/clip revisao` - Lista todas as tasks pendentes de revisão",
             "`/clip approve <id>` - Approve a pending approval",
             "`/clip acp spawn <agent> [display]` - Add an agent to this thread",
             "`/clip acp status` - Show all agents in this thread",
@@ -809,6 +809,52 @@ async function handleIssuesCommand(ctx: PluginContext, companyId: string, respon
       },
     ],
   });
+}
+
+async function listAllIssuesByStatus(
+  ctx: PluginContext,
+  companyId: string,
+  status: IssueQueueStatus,
+) {
+  const issues = [];
+  const seen = new Set<string>();
+  const limit = 100;
+  let offset = 0;
+
+  while (true) {
+    const page = await ctx.issues.list({ companyId, status, limit, offset });
+    let added = 0;
+    for (const issue of page) {
+      if (seen.has(issue.id)) continue;
+      seen.add(issue.id);
+      issues.push(issue);
+      added++;
+    }
+    if (page.length < limit || added === 0) break;
+    offset += page.length;
+  }
+  return issues;
+}
+
+async function handleIssueQueueCommand(
+  ctx: PluginContext,
+  companyId: string,
+  responseUrl: string,
+  userId: string,
+  status: IssueQueueStatus,
+): Promise<void> {
+  if (pluginConfig.slackUserId && userId !== pluginConfig.slackUserId) {
+    await respondEphemeral(ctx, responseUrl, {
+      text: ":no_entry: Você não está autorizado a consultar as tasks desta empresa.",
+    });
+    return;
+  }
+  const issues = await listAllIssuesByStatus(ctx, companyId, status);
+  await respondEphemeral(
+    ctx,
+    responseUrl,
+    buildIssueQueueMessage(issues, status, pluginConfig.paperclipBaseUrl),
+  );
 }
 
 async function handleApproveCommand(ctx: PluginContext, responseUrl: string, approvalId: string): Promise<void> {

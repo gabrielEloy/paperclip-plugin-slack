@@ -1,6 +1,6 @@
 {
   "name": "paperclip-plugin-slack",
-  "version": "2.1.0-contadev.3",
+  "version": "2.1.0-contadev.4",
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {
