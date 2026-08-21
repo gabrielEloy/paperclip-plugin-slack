@@ -63,7 +63,9 @@ let socketModeClient: SlackSocketModeClient | null = null;
 let paperclipApiKey = "";
 let applyRuntimeConfig: ((config: SlackConfig, companyId: string) => Promise<void>) | null = null;
 const issueBySlackThread = new Map<string, string>();
+const slackThreadByIssue = new Map<string, { channelId: string; threadTs: string }>();
 const handledSlackEvents = new Set<string>();
+const handledPaperclipEvents = new Set<string>();
 const notifiedIssueIds = new Set<string>();
 
 // --- Slack signature verification ---
@@ -206,7 +208,10 @@ async function handleSlackEventCallback(
     const serialized = JSON.stringify(root ?? {});
     const match = serialized.match(/\/issues\/([0-9a-f]{8}-[0-9a-f-]{27,})/i);
     issueId = match?.[1] ?? null;
-    if (issueId) issueBySlackThread.set(`${channel}:${threadTs}`, issueId);
+    if (issueId) {
+      issueBySlackThread.set(`${channel}:${threadTs}`, issueId);
+      slackThreadByIssue.set(issueId, { channelId: channel, threadTs });
+    }
   }
 
   if (issueId && text) {
@@ -944,6 +949,7 @@ const plugin = definePlugin({
         );
         if (channelId) {
           issueBySlackThread.set(`${channelId}:${result.ts}`, issueId);
+          slackThreadByIssue.set(issueId, { channelId, threadTs: result.ts });
           await ctx.state.set(
             { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.threadIssueChannel(issueId) },
             channelId,
@@ -960,6 +966,8 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
+      if (handledPaperclipEvents.has(event.eventId)) return;
+      handledPaperclipEvents.add(event.eventId);
       const issueId = event.entityId ?? "";
       const payload = event.payload as Record<string, unknown>;
       const commentId = String(payload.commentId ?? "");
@@ -970,16 +978,17 @@ const plugin = definePlugin({
       const comment = comments.find((candidate) => candidate.id === commentId);
       if (!comment || comment.authorUserId === live.paperclipUserId) return;
 
-      const threadTs = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: event.companyId,
-        stateKey: STATE_KEYS.threadIssue(issueId),
-      }) as string | null;
-      const channelId = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: event.companyId,
-        stateKey: STATE_KEYS.threadIssueChannel(issueId),
-      }) as string | null;
+      const linkedThread = slackThreadByIssue.get(issueId);
+      const threadTs = linkedThread?.threadTs ?? await ctx.state.get({
+          scopeKind: "company",
+          scopeId: event.companyId,
+          stateKey: STATE_KEYS.threadIssue(issueId),
+        }) as string | null;
+      const channelId = linkedThread?.channelId ?? await ctx.state.get({
+          scopeKind: "company",
+          scopeId: event.companyId,
+          stateKey: STATE_KEYS.threadIssueChannel(issueId),
+        }) as string | null;
       if (!threadTs || !channelId) return;
 
       let authorName = "Paperclip";
@@ -993,20 +1002,24 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("issue.updated", async (event: PluginEvent) => {
+      if (handledPaperclipEvents.has(event.eventId)) return;
+      handledPaperclipEvents.add(event.eventId);
       const live = await getConfig(event.companyId);
       if (!live.notifyOnIssueDone) return;
       const payload = event.payload as Record<string, unknown>;
       if (payload.status !== "done") return;
-      const threadTs = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: event.companyId,
-        stateKey: STATE_KEYS.threadIssue(event.entityId ?? ""),
-      }) as string | null;
-      const channelId = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: event.companyId,
-        stateKey: STATE_KEYS.threadIssueChannel(event.entityId ?? ""),
-      }) as string | null;
+      const issueId = event.entityId ?? "";
+      const linkedThread = slackThreadByIssue.get(issueId);
+      const threadTs = linkedThread?.threadTs ?? await ctx.state.get({
+          scopeKind: "company",
+          scopeId: event.companyId,
+          stateKey: STATE_KEYS.threadIssue(issueId),
+        }) as string | null;
+      const channelId = linkedThread?.channelId ?? await ctx.state.get({
+          scopeKind: "company",
+          scopeId: event.companyId,
+          stateKey: STATE_KEYS.threadIssueChannel(issueId),
+        }) as string | null;
       await notify(event, formatIssueDone, channelId ?? undefined, threadTs ? { threadTs } : undefined);
     });
 
