@@ -1625,16 +1625,16 @@ const plugin = definePlugin({
   },
 
   async onValidateConfig(config) {
-    if (!config.slackTokenRef || typeof config.slackTokenRef !== "string") {
+    if (!config.slackTokenRef) {
       return { ok: false, errors: ["slackTokenRef is required"] };
     }
     if (!config.defaultChannelId || typeof config.defaultChannelId !== "string") {
       return { ok: false, errors: ["defaultChannelId is required"] };
     }
-    if (!config.slackAppTokenRef || typeof config.slackAppTokenRef !== "string") {
+    if (!config.slackAppTokenRef) {
       return { ok: false, errors: ["slackAppTokenRef is required for bidirectional Socket Mode"] };
     }
-    if (!config.paperclipApiKeyRef || typeof config.paperclipApiKeyRef !== "string") {
+    if (!config.paperclipApiKeyRef) {
       return { ok: false, errors: ["paperclipApiKeyRef is required for Slack reply relay"] };
     }
     if (!config.slackUserId || typeof config.slackUserId !== "string") {

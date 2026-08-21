@@ -1,4 +1,5 @@
 import type { PluginContext, PluginHealthDiagnostics } from "@paperclipai/plugin-sdk";
+import type { SecretRef } from "./types.js";
 
 export type SlackRuntimeHealth = PluginHealthDiagnostics & {
   message?: string;
@@ -10,7 +11,7 @@ export const SECRET_RESOLUTION_ISSUE_URL = "https://github.com/mvanhorn/papercli
 
 export async function resolveStartupSlackToken(
   ctx: PluginContext,
-  tokenRef: string,
+  tokenRef: SecretRef,
   companyId: string,
   setHealth: (health: SlackRuntimeHealth) => void,
 ): Promise<string | undefined> {

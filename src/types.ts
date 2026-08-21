@@ -1,8 +1,10 @@
+export type SecretRef = string | { type: "secret_ref"; secretId: string; version?: "latest" | number };
+
 export type SlackConfig = {
-  slackTokenRef: string;
-  slackSigningSecretRef: string;
-  slackAppTokenRef: string;
-  paperclipApiKeyRef: string;
+  slackTokenRef: SecretRef;
+  slackSigningSecretRef: SecretRef | "";
+  slackAppTokenRef: SecretRef;
+  paperclipApiKeyRef: SecretRef;
   slackUserId: string;
   paperclipUserId: string;
   defaultChannelId: string;
