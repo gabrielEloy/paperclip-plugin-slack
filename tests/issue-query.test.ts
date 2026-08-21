@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Issue } from "@paperclipai/shared";
-import { buildIssueQueueMessage } from "../src/issue-query.js";
+import { buildIssueQueueMessage, parseIssueQueueMessage } from "../src/issue-query.js";
 
 function issue(input: Partial<Issue> & Pick<Issue, "id" | "title" | "status">): Issue {
   return {
@@ -70,5 +70,34 @@ describe("buildIssueQueueMessage", () => {
     expect(rendered).not.toContain("<!channel>");
     expect(rendered).toContain("&amp;");
     expect(rendered).toContain("¦");
+  });
+});
+
+describe("parseIssueQueueMessage", () => {
+  it.each([
+    "bloqueadas",
+    "bloqueados",
+    "blocked",
+    "clip bloqueadas",
+    "O que está bloqueado?",
+    "Quais tasks estão bloqueadas?",
+  ])("recognizes a blocked queue request: %s", (query) => {
+    expect(parseIssueQueueMessage(query)).toBe("blocked");
+  });
+
+  it.each([
+    "revisao",
+    "revisão",
+    "review",
+    "in_review",
+    "clip revisao",
+    "O que está pendente de revisão?",
+    "Quais tasks estão em revisão?",
+  ])("recognizes a review queue request: %s", (query) => {
+    expect(parseIssueQueueMessage(query)).toBe("in_review");
+  });
+
+  it("does not intercept an ordinary DM", () => {
+    expect(parseIssueQueueMessage("Bom dia, Paperclip")).toBeNull();
   });
 });

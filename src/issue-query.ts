@@ -3,6 +3,24 @@ import type { SlackMessage } from "./slack-api.js";
 
 export type IssueQueueStatus = "blocked" | "in_review";
 
+function normalizeQuery(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .replace(/[?!.,:;]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^clip\s+/, "");
+}
+
+export function parseIssueQueueMessage(value: string): IssueQueueStatus | null {
+  const query = normalizeQuery(value);
+  if (/\b(?:blocked|bloquead[ao]s?)\b/.test(query)) return "blocked";
+  if (/\b(?:review|revisao|in_review)\b/.test(query)) return "in_review";
+  return null;
+}
+
 const PRIORITY_ORDER: Record<string, number> = {
   critical: 0,
   high: 1,

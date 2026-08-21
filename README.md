@@ -116,6 +116,11 @@ This is that plugin.
 - `/clip watches` - List active event watches
 - `/clip help` - Show this help message
 
+The `/clip` command must be registered in the Slack app configuration. With
+Socket Mode, the paired user can query the same queues without a slash command
+by sending `bloqueadas`, `revisao`, or a natural-language equivalent directly
+to the Paperclip app DM.
+
 ## Install
 
 ```bash

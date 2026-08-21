@@ -80,7 +80,11 @@ import {
   type PlanApprovalInteraction,
   type PlanApprovalMessageRef,
 } from "./plan-approval.js";
-import { buildIssueQueueMessage, type IssueQueueStatus } from "./issue-query.js";
+import {
+  buildIssueQueueMessage,
+  parseIssueQueueMessage,
+  type IssueQueueStatus,
+} from "./issue-query.js";
 import { encodeSlashCommandPayload, parseSlashCommand } from "./slash-command.js";
 
 let pluginCtx: PluginContext;
@@ -200,13 +204,43 @@ async function handleSlackEventCallback(
   const userId = String(event.user ?? "");
   const text = String(event.text ?? "").trim();
   const files = Array.isArray(event.files) ? event.files as Array<Record<string, unknown>> : [];
-  if (!channel || !threadTs || (!text && files.length === 0)) return;
+  if (!channel || (!text && files.length === 0)) return;
 
   const config = pluginConfig;
   if (config.slackUserId && userId !== config.slackUserId) {
-    ctx.logger.warn("Ignoring Slack thread reply from an unauthorized user", { userId, channel });
+    ctx.logger.warn("Ignoring Slack message from an unauthorized user", { userId, channel });
     return;
   }
+
+  const channelType = String(event.channel_type ?? "");
+  const dmQueueStatus = channelType === "im" || channel.startsWith("D")
+    ? parseIssueQueueMessage(text)
+    : null;
+  if (dmQueueStatus) {
+    if (!pluginCompanyId) {
+      await postMessage(ctx, pluginToken, channel, {
+        text: ":warning: Nenhuma empresa está vinculada a esta conversa.",
+      }, threadTs ? { threadTs } : undefined);
+      return;
+    }
+    const issues = await listAllIssuesByStatus(ctx, pluginCompanyId, dmQueueStatus);
+    const result = await postMessage(
+      ctx,
+      pluginToken,
+      channel,
+      buildIssueQueueMessage(issues, dmQueueStatus, config.paperclipBaseUrl),
+      threadTs ? { threadTs } : undefined,
+    );
+    if (!result.ok) {
+      throw new Error(`Slack DM issue query failed: ${result.error ?? "unknown error"}`);
+    }
+    await ctx.metrics.write("slack.commands.handled", 1, {
+      command_name: dmQueueStatus === "blocked" ? "dm_blocked" : "dm_review",
+    });
+    return;
+  }
+
+  if (!threadTs) return;
 
   let issueId = issueBySlackThread.get(`${channel}:${threadTs}`) ?? null;
   if (!issueId) {
