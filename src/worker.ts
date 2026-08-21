@@ -2013,6 +2013,12 @@ const plugin = definePlugin({
       const planRejectionSubmission = payload.type === "view_submission"
         && view?.callback_id === PLAN_REJECT_MODAL_CALLBACK_ID;
       if (planAction || planRejectionSubmission) {
+        // Socket Mode is the configured transport. Never let an unsigned HTTP
+        // webhook synthesize a plan decision when no signing secret is bound.
+        if (!slackSigningSecret) {
+          pluginCtx.logger.warn("Rejected unsigned Slack Plan approval webhook");
+          return;
+        }
         await handleSlackInteractivePayload(pluginCtx, payload);
         return;
       }
