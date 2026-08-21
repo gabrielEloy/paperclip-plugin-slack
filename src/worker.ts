@@ -917,7 +917,7 @@ const plugin = definePlugin({
       if (!live.notifyOnIssueCreated) return;
       const result = await notify(event, formatIssueCreated);
       if (result?.ok && result.ts) {
-        const channelId = await resolveChannel(ctx, event.companyId, config.defaultChannelId);
+        const channelId = result.channel ?? await resolveChannel(ctx, event.companyId, config.defaultChannelId);
         await ctx.state.set(
           { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.threadIssue(event.entityId ?? "") },
           result.ts,
@@ -978,7 +978,12 @@ const plugin = definePlugin({
         scopeId: event.companyId,
         stateKey: STATE_KEYS.threadIssue(event.entityId ?? ""),
       }) as string | null;
-      await notify(event, formatIssueDone, undefined, threadTs ? { threadTs } : undefined);
+      const channelId = await ctx.state.get({
+        scopeKind: "company",
+        scopeId: event.companyId,
+        stateKey: STATE_KEYS.threadIssueChannel(event.entityId ?? ""),
+      }) as string | null;
+      await notify(event, formatIssueDone, channelId ?? undefined, threadTs ? { threadTs } : undefined);
     });
 
     ctx.events.on("approval.created", async (event: PluginEvent) => {

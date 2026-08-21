@@ -46,7 +46,7 @@ export async function postMessage(
   channelId: string,
   message: SlackMessage,
   opts?: { threadTs?: string },
-): Promise<{ ok: boolean; ts?: string; error?: string }> {
+): Promise<{ ok: boolean; ts?: string; channel?: string; error?: string }> {
   const payload: Record<string, unknown> = {
     channel: channelId,
     text: message.text,
@@ -65,7 +65,7 @@ export async function postMessage(
     body: JSON.stringify(payload),
   });
 
-  const body = await response.json() as { ok: boolean; ts?: string; error?: string };
+  const body = await response.json() as { ok: boolean; ts?: string; channel?: string; error?: string };
 
   if (!body.ok) {
     ctx.logger.warn("Slack API error", { error: body.error, channelId });

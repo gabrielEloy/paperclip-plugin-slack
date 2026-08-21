@@ -14,7 +14,7 @@ export class SlackAdapter {
     channelId: string,
     text: string,
     opts?: { threadTs?: string },
-  ): Promise<{ ok: boolean; ts?: string }> {
+  ): Promise<{ ok: boolean; ts?: string; channel?: string }> {
     return postMessage(this.ctx, this.token, channelId, {
       text,
       blocks: [
@@ -36,7 +36,7 @@ export class SlackAdapter {
       style?: "primary" | "danger";
     }>,
     opts?: { threadTs?: string },
-  ): Promise<{ ok: boolean; ts?: string }> {
+  ): Promise<{ ok: boolean; ts?: string; channel?: string }> {
     const elements = buttons.map((btn) => {
       const el: Record<string, unknown> = {
         type: "button",
