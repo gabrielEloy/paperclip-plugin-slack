@@ -40,6 +40,37 @@ const MAX_RETRIES = 3;
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503]);
 const openedDmChannels = new Map<string, string>();
 
+export async function resolveSlackChannelId(
+  ctx: PluginContext,
+  token: string,
+  channelId: string,
+): Promise<string | null> {
+  if (!channelId.startsWith("U")) return channelId;
+  const cached = openedDmChannels.get(channelId);
+  if (cached) return cached;
+
+  const openResponse = await fetchWithRetry(ctx, `${SLACK_API_BASE}/conversations.open`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ users: channelId }),
+  });
+  const openBody = await openResponse.json() as {
+    ok: boolean;
+    channel?: { id?: string };
+    error?: string;
+  };
+  const dmChannelId = openBody.channel?.id;
+  if (!openBody.ok || !dmChannelId) {
+    ctx.logger.warn("Slack conversations.open failed", { error: openBody.error, userId: channelId });
+    return null;
+  }
+  openedDmChannels.set(channelId, dmChannelId);
+  return dmChannelId;
+}
+
 async function fetchWithRetry(
   ctx: PluginContext,
   url: string,
@@ -70,34 +101,8 @@ export async function postMessage(
   message: SlackMessage,
   opts?: { threadTs?: string },
 ): Promise<{ ok: boolean; ts?: string; channel?: string; error?: string }> {
-  let resolvedChannelId = channelId;
-  if (channelId.startsWith("U")) {
-    const cached = openedDmChannels.get(channelId);
-    if (cached) {
-      resolvedChannelId = cached;
-    } else {
-      const openResponse = await fetchWithRetry(ctx, `${SLACK_API_BASE}/conversations.open`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ users: channelId }),
-      });
-      const openBody = await openResponse.json() as {
-        ok: boolean;
-        channel?: { id?: string };
-        error?: string;
-      };
-      const dmChannelId = openBody.channel?.id;
-      if (!openBody.ok || !dmChannelId) {
-        ctx.logger.warn("Slack conversations.open failed", { error: openBody.error, userId: channelId });
-        return { ok: false, error: openBody.error ?? "dm_open_failed" };
-      }
-      openedDmChannels.set(channelId, dmChannelId);
-      resolvedChannelId = dmChannelId;
-    }
-  }
+  const resolvedChannelId = await resolveSlackChannelId(ctx, token, channelId);
+  if (!resolvedChannelId) return { ok: false, error: "dm_open_failed" };
 
   const payload: Record<string, unknown> = {
     channel: resolvedChannelId,

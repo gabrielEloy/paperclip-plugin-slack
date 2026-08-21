@@ -8,7 +8,14 @@ import {
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
 import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID, DEFAULT_CONFIG } from "./constants.js";
-import { openView, postMessage, respondToAction, respondEphemeral, updateMessage } from "./slack-api.js";
+import {
+  openView,
+  postMessage,
+  resolveSlackChannelId,
+  respondToAction,
+  respondEphemeral,
+  updateMessage,
+} from "./slack-api.js";
 import type { SlackMessage } from "./slack-api.js";
 import type { SlackConfig, EscalationRecord, CommandDefinition, SessionEntry } from "./types.js";
 import { SlackAdapter } from "./adapter.js";
@@ -344,9 +351,8 @@ async function markPlanApprovalResolved(
 ): Promise<void> {
   await ctx.state.set(
     {
-      scopeKind: "company",
-      scopeId: pluginCompanyId,
-      stateKey: STATE_KEYS.planApprovalResolved(interactionId),
+      scopeKind: "instance",
+      stateKey: `${pluginCompanyId}:${STATE_KEYS.planApprovalResolved(interactionId)}`,
     },
     true,
   );
@@ -358,8 +364,10 @@ async function updateResolvedPlanApproval(
   interaction: PlanApprovalInteraction,
   slackUserId?: string,
 ): Promise<void> {
-  const issue = await ctx.issues.get(ref.issueId, pluginCompanyId);
-  if (!issue) throw new Error(`Paperclip issue ${ref.issueId} was not found`);
+  const issue = await paperclipRequest<{ id: string; identifier?: string | null; title?: string | null }>(
+    ctx,
+    `/api/issues/${ref.issueId}`,
+  );
   const updated = await updateMessage(
     ctx,
     pluginToken,
@@ -369,6 +377,61 @@ async function updateResolvedPlanApproval(
   );
   if (!updated.ok) throw new Error(updated.error ?? "Could not update the Slack plan approval card");
   await markPlanApprovalResolved(ctx, ref.interactionId);
+}
+
+async function findSlackThreadForIssue(
+  ctx: PluginContext,
+  issueId: string,
+  issueIdentifier?: string | null,
+): Promise<{ channelId: string; threadTs: string } | null> {
+  const cached = slackThreadByIssue.get(issueId);
+  if (cached) return cached;
+
+  const channelId = await resolveSlackChannelId(
+    ctx,
+    pluginToken,
+    pluginConfig.defaultChannelId,
+  );
+  if (!channelId) return null;
+
+  let cursor = "";
+  for (let page = 0; page < 5; page++) {
+    const query = new URLSearchParams({ channel: channelId, limit: "100" });
+    if (cursor) query.set("cursor", cursor);
+    const response = await ctx.http.fetch(
+      `https://slack.com/api/conversations.history?${query.toString()}`,
+      { headers: { Authorization: `Bearer ${pluginToken}` } },
+    );
+    const body = await response.json() as {
+      ok?: boolean;
+      error?: string;
+      messages?: Array<Record<string, unknown>>;
+      response_metadata?: { next_cursor?: string };
+    };
+    if (!body.ok) {
+      ctx.logger.warn("Could not search Slack history for an issue thread", {
+        error: body.error,
+        issueId,
+      });
+      return null;
+    }
+    const root = body.messages?.find((message) => {
+      if (message.thread_ts) return false;
+      const serialized = JSON.stringify(message);
+      return serialized.includes(issueId)
+        || Boolean(issueIdentifier && serialized.includes(issueIdentifier));
+    });
+    const threadTs = String(root?.ts ?? "");
+    if (threadTs) {
+      const linked = { channelId, threadTs };
+      slackThreadByIssue.set(issueId, linked);
+      issueBySlackThread.set(`${channelId}:${threadTs}`, issueId);
+      return linked;
+    }
+    cursor = body.response_metadata?.next_cursor?.trim() ?? "";
+    if (!cursor) break;
+  }
+  return null;
 }
 
 async function reportPlanApprovalFailure(
@@ -424,19 +487,15 @@ async function handleSlackInteractivePayload(
     }
 
     try {
-      const result = await ctx.issues.respondInteraction(
-        ref.issueId,
-        ref.interactionId,
-        {
-          action: "accept",
-          actorUserId: pluginConfig.paperclipUserId,
-        },
-        pluginCompanyId,
+      const interaction = await paperclipRequest<PlanApprovalInteraction>(
+        ctx,
+        `/api/issues/${ref.issueId}/interactions/${ref.interactionId}/accept`,
+        { method: "POST", body: JSON.stringify({}) },
       );
       await updateResolvedPlanApproval(
         ctx,
         { ...ref, ...location },
-        result.interaction as unknown as PlanApprovalInteraction,
+        interaction,
         userId,
       );
       await ctx.metrics.write("slack.plan_approvals.decided", 1, { decision: "accept" });
@@ -455,20 +514,18 @@ async function handleSlackInteractivePayload(
           privateMetadata: String(view.private_metadata ?? ""),
           state: (view.state ?? {}) as Parameters<typeof parsePlanRejectionSubmission>[0]["state"],
         });
-        const result = await ctx.issues.respondInteraction(
-          submission.issueId,
-          submission.interactionId,
+        const interaction = await paperclipRequest<PlanApprovalInteraction>(
+          ctx,
+          `/api/issues/${submission.issueId}/interactions/${submission.interactionId}/reject`,
           {
-            action: "reject",
-            actorUserId: pluginConfig.paperclipUserId,
-            reason: submission.reason,
+            method: "POST",
+            body: JSON.stringify({ reason: submission.reason }),
           },
-          pluginCompanyId,
         );
         await updateResolvedPlanApproval(
           ctx,
           submission,
-          result.interaction as unknown as PlanApprovalInteraction,
+          interaction,
           userId,
         );
         await ctx.metrics.write("slack.plan_approvals.decided", 1, { decision: "reject" });
@@ -1425,159 +1482,147 @@ const plugin = definePlugin({
     // =========================================================================
 
     ctx.jobs.register("check-pending-plan-approvals", async () => {
-      const companies = await ctx.companies.list({ limit: 100, offset: 0 });
-      for (const company of companies) {
-        const live = await getConfig(company.id);
-        // Older persisted configs predate this flag; absence means enabled so
-        // installing the upgrade immediately mirrors pending Plan reviews.
-        if (live.notifyOnPlanApproval === false) continue;
+      // Scheduled jobs have no company invocation scope. Use the already-paired
+      // board credential and instance-scoped plugin state; the Paperclip routes
+      // still authenticate and attribute every decision to that board user.
+      if (!pluginCompanyId || !paperclipApiKey || !pluginConfig.paperclipBaseUrl) return;
+      if (pluginConfig.notifyOnPlanApproval === false) return;
 
-        const storedRegistry = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.planApprovalRegistry,
+      type ReviewIssue = { id: string; identifier?: string | null; title?: string | null };
+      const statePrefix = `${pluginCompanyId}:`;
+      const storedRegistry = await ctx.state.get({
+        scopeKind: "instance",
+        stateKey: `${statePrefix}${STATE_KEYS.planApprovalRegistry}`,
+      });
+      const registry = Array.isArray(storedRegistry)
+        ? storedRegistry as PlanApprovalMessageRef[]
+        : [];
+
+      // First converge cards that were resolved in Paperclip instead of Slack.
+      for (const ref of registry) {
+        const alreadyResolved = await ctx.state.get({
+          scopeKind: "instance",
+          stateKey: `${statePrefix}${STATE_KEYS.planApprovalResolved(ref.interactionId)}`,
         });
-        const registry = Array.isArray(storedRegistry)
-          ? storedRegistry as PlanApprovalMessageRef[]
-          : [];
-
-        // First converge cards that were resolved in Paperclip instead of Slack.
-        for (const ref of registry) {
-          const alreadyResolved = await ctx.state.get({
-            scopeKind: "company",
-            scopeId: company.id,
-            stateKey: STATE_KEYS.planApprovalResolved(ref.interactionId),
-          });
-          if (alreadyResolved) continue;
-          try {
-            const [issue, interactions] = await Promise.all([
-              ctx.issues.get(ref.issueId, company.id),
-              ctx.issues.listInteractions(ref.issueId, company.id),
-            ]);
-            const interaction = interactions.find((candidate) => candidate.id === ref.interactionId);
-            if (
-              !issue
-              || !interaction
-              || interaction.status === "pending"
-              || !isPlanApprovalInteraction(interaction)
-            ) continue;
-            const updated = await updateMessage(
-              ctx,
-              token,
-              ref.channelId,
-              ref.messageTs,
-              buildResolvedPlanApprovalMessage(
-                issue,
-                interaction,
-                live.paperclipBaseUrl,
-              ),
+        if (alreadyResolved) continue;
+        try {
+          const [issue, interactions] = await Promise.all([
+            paperclipRequest<ReviewIssue>(ctx, `/api/issues/${ref.issueId}`),
+            paperclipRequest<PlanApprovalInteraction[]>(ctx, `/api/issues/${ref.issueId}/interactions`),
+          ]);
+          const interaction = interactions.find((candidate) => candidate.id === ref.interactionId);
+          if (
+            !interaction
+            || interaction.status === "pending"
+            || !isPlanApprovalInteraction(interaction)
+          ) continue;
+          const updated = await updateMessage(
+            ctx,
+            token,
+            ref.channelId,
+            ref.messageTs,
+            buildResolvedPlanApprovalMessage(
+              issue,
+              interaction,
+              pluginConfig.paperclipBaseUrl,
+            ),
+          );
+          if (updated.ok) {
+            await ctx.state.set(
+              {
+                scopeKind: "instance",
+                stateKey: `${statePrefix}${STATE_KEYS.planApprovalResolved(ref.interactionId)}`,
+              },
+              true,
             );
-            if (updated.ok) {
+          }
+        } catch (err) {
+          ctx.logger.warn("Could not synchronize a resolved Plan approval card", {
+            error: String(err),
+            interactionId: ref.interactionId,
+          });
+        }
+      }
+
+      let offset = 0;
+      while (true) {
+        const issues = await paperclipRequest<ReviewIssue[]>(
+          ctx,
+          `/api/companies/${pluginCompanyId}/issues?status=in_review&limit=100&offset=${offset}`,
+        );
+        for (const issue of issues) {
+          try {
+            const interactions = await paperclipRequest<PlanApprovalInteraction[]>(
+              ctx,
+              `/api/issues/${issue.id}/interactions`,
+            );
+            for (const interaction of interactions) {
+              if (
+                interaction.status !== "pending"
+                || !isPlanApprovalInteraction(interaction)
+              ) continue;
+
+              const storedMessage = await ctx.state.get({
+                scopeKind: "instance",
+                stateKey: `${statePrefix}${STATE_KEYS.planApprovalMessage(interaction.id)}`,
+              }) as PlanApprovalMessageRef | null;
+              if (storedMessage) {
+                if (!registry.some((entry) => entry.interactionId === interaction.id)) {
+                  registry.push(storedMessage);
+                }
+                continue;
+              }
+
+              const linkedThread = await findSlackThreadForIssue(
+                ctx,
+                issue.id,
+                issue.identifier,
+              );
+              if (!linkedThread) continue;
+
+              const sent = await postMessage(
+                ctx,
+                token,
+                linkedThread.channelId,
+                buildPlanApprovalMessage(issue, interaction, pluginConfig.paperclipBaseUrl),
+                { threadTs: linkedThread.threadTs },
+              );
+              if (!sent.ok || !sent.ts) continue;
+
+              const messageRef: PlanApprovalMessageRef = {
+                issueId: issue.id,
+                interactionId: interaction.id,
+                channelId: sent.channel ?? linkedThread.channelId,
+                messageTs: sent.ts,
+              };
               await ctx.state.set(
                 {
-                  scopeKind: "company",
-                  scopeId: company.id,
-                  stateKey: STATE_KEYS.planApprovalResolved(ref.interactionId),
+                  scopeKind: "instance",
+                  stateKey: `${statePrefix}${STATE_KEYS.planApprovalMessage(interaction.id)}`,
                 },
-                true,
+                messageRef,
               );
+              registry.push(messageRef);
+              await ctx.metrics.write("slack.plan_approvals.sent", 1);
             }
           } catch (err) {
-            ctx.logger.warn("Could not synchronize a resolved Plan approval card", {
+            ctx.logger.warn("Could not mirror pending Plan approvals for an issue", {
               error: String(err),
-              interactionId: ref.interactionId,
+              issueId: issue.id,
             });
           }
         }
-
-        let offset = 0;
-        while (true) {
-          const issues = await ctx.issues.list({
-            companyId: company.id,
-            status: "in_review",
-            limit: 100,
-            offset,
-          });
-          for (const issue of issues) {
-            try {
-              const interactions = await ctx.issues.listInteractions(issue.id, company.id);
-              for (const interaction of interactions) {
-                if (
-                  interaction.status !== "pending"
-                  || !isPlanApprovalInteraction(interaction)
-                ) continue;
-
-                const storedMessage = await ctx.state.get({
-                  scopeKind: "company",
-                  scopeId: company.id,
-                  stateKey: STATE_KEYS.planApprovalMessage(interaction.id),
-                }) as PlanApprovalMessageRef | null;
-                if (storedMessage) {
-                  if (!registry.some((entry) => entry.interactionId === interaction.id)) {
-                    registry.push(storedMessage);
-                  }
-                  continue;
-                }
-
-                const linkedThread = slackThreadByIssue.get(issue.id);
-                const threadTs = linkedThread?.threadTs ?? await ctx.state.get({
-                  scopeKind: "company",
-                  scopeId: company.id,
-                  stateKey: STATE_KEYS.threadIssue(issue.id),
-                }) as string | null;
-                const channelId = linkedThread?.channelId ?? await ctx.state.get({
-                  scopeKind: "company",
-                  scopeId: company.id,
-                  stateKey: STATE_KEYS.threadIssueChannel(issue.id),
-                }) as string | null;
-                if (!threadTs || !channelId) continue;
-
-                const sent = await postMessage(
-                  ctx,
-                  token,
-                  channelId,
-                  buildPlanApprovalMessage(issue, interaction, live.paperclipBaseUrl),
-                  { threadTs },
-                );
-                if (!sent.ok || !sent.ts) continue;
-
-                const messageRef: PlanApprovalMessageRef = {
-                  issueId: issue.id,
-                  interactionId: interaction.id,
-                  channelId: sent.channel ?? channelId,
-                  messageTs: sent.ts,
-                };
-                await ctx.state.set(
-                  {
-                    scopeKind: "company",
-                    scopeId: company.id,
-                    stateKey: STATE_KEYS.planApprovalMessage(interaction.id),
-                  },
-                  messageRef,
-                );
-                registry.push(messageRef);
-                await ctx.metrics.write("slack.plan_approvals.sent", 1);
-              }
-            } catch (err) {
-              ctx.logger.warn("Could not mirror pending Plan approvals for an issue", {
-                error: String(err),
-                issueId: issue.id,
-              });
-            }
-          }
-          if (issues.length < 100) break;
-          offset += issues.length;
-        }
-
-        await ctx.state.set(
-          {
-            scopeKind: "company",
-            scopeId: company.id,
-            stateKey: STATE_KEYS.planApprovalRegistry,
-          },
-          registry.slice(-500),
-        );
+        if (issues.length < 100) break;
+        offset += issues.length;
       }
+
+      await ctx.state.set(
+        {
+          scopeKind: "instance",
+          stateKey: `${statePrefix}${STATE_KEYS.planApprovalRegistry}`,
+        },
+        registry.slice(-500),
+      );
     });
 
     // Daily digest

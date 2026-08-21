@@ -36,11 +36,7 @@ const interaction: PlanApprovalInteraction = {
 };
 
 describe("Slack Plan approval", () => {
-  it("declares the managed job and least-privilege interaction capabilities", () => {
-    expect(manifest.capabilities).toEqual(expect.arrayContaining([
-      "issue.interactions.read",
-      "issue.interactions.respond",
-    ]));
+  it("declares the managed polling job", () => {
     expect(manifest.jobs?.find((job) => job.jobKey === "check-pending-plan-approvals"))
       .toMatchObject({ schedule: "*/1 * * * *" });
   });
