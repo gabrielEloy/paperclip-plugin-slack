@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-slack";
-export const PLUGIN_VERSION = "2.1.0-contadev.2";
+export const PLUGIN_VERSION = "2.1.0-contadev.3";
 
 export const WEBHOOK_KEYS = {
   slackEvents: "slack-events",
@@ -36,6 +36,9 @@ export const STATE_KEYS = {
   budgetAlert: (id: string, bucket: number) => `budget-alert-${id}-${bucket}`,
   watchRegistry: (ch: string, ts: string) => `watches_${ch}_${ts}`,
   commandRegistry: "custom-commands",
+  planApprovalMessage: (id: string) => `plan-approval-message-${id}`,
+  planApprovalRegistry: "plan-approval-registry",
+  planApprovalResolved: (id: string) => `plan-approval-resolved-${id}`,
 } as const;
 
 export const DEFAULT_CONFIG = {
@@ -53,6 +56,7 @@ export const DEFAULT_CONFIG = {
   notifyOnIssueCreated: true,
   notifyOnIssueDone: true,
   notifyOnApprovalCreated: true,
+  notifyOnPlanApproval: true,
   notifyOnAgentError: true,
   notifyOnAgentConnected: true,
   notifyOnBudgetThreshold: true,

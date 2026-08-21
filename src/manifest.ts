@@ -21,6 +21,8 @@ const manifest: PaperclipPluginManifestV1 = {
     "companies.read",
     "issues.read",
     "issues.create",
+    "issue.interactions.read",
+    "issue.interactions.respond",
     "issue.comments.read",
     "agents.read",
     "agent.sessions.create",
@@ -121,6 +123,12 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Notify on approval requested",
         default: DEFAULT_CONFIG.notifyOnApprovalCreated,
       },
+      notifyOnPlanApproval: {
+        type: "boolean",
+        title: "Notify on plan approval requested",
+        description: "Posts pending Plan confirmation cards in each issue's Slack thread and lets the paired user approve or request changes.",
+        default: DEFAULT_CONFIG.notifyOnPlanApproval,
+      },
       notifyOnAgentError: {
         type: "boolean",
         title: "Notify on agent error",
@@ -182,6 +190,12 @@ const manifest: PaperclipPluginManifestV1 = {
     required: ["slackTokenRef", "slackAppTokenRef", "paperclipApiKeyRef", "slackUserId", "paperclipUserId", "defaultChannelId"],
   },
   jobs: [
+    {
+      jobKey: "check-pending-plan-approvals",
+      displayName: "Check Pending Plan Approvals",
+      description: "Mirrors pending Paperclip Plan confirmations into their linked Slack issue threads.",
+      schedule: "*/1 * * * *",
+    },
     {
       jobKey: "daily-digest",
       displayName: "Daily Activity Digest",

@@ -15,6 +15,7 @@ export type SlackConfig = {
   notifyOnIssueCreated: boolean;
   notifyOnIssueDone: boolean;
   notifyOnApprovalCreated: boolean;
+  notifyOnPlanApproval: boolean;
   notifyOnAgentError: boolean;
   notifyOnAgentConnected: boolean;
   notifyOnBudgetThreshold: boolean;

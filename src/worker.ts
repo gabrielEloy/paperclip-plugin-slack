@@ -8,7 +8,7 @@ import {
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
 import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID, DEFAULT_CONFIG } from "./constants.js";
-import { openView, postMessage, respondToAction, respondEphemeral } from "./slack-api.js";
+import { openView, postMessage, respondToAction, respondEphemeral, updateMessage } from "./slack-api.js";
 import type { SlackMessage } from "./slack-api.js";
 import type { SlackConfig, EscalationRecord, CommandDefinition, SessionEntry } from "./types.js";
 import { SlackAdapter } from "./adapter.js";
@@ -60,6 +60,19 @@ import {
   parseCreateTaskSubmission,
   type TaskFormOption,
 } from "./task-action.js";
+import {
+  PLAN_APPROVE_ACTION_ID,
+  PLAN_REJECT_ACTION_ID,
+  PLAN_REJECT_MODAL_CALLBACK_ID,
+  buildPlanApprovalMessage,
+  buildPlanRejectionModal,
+  buildResolvedPlanApprovalMessage,
+  decodePlanApprovalActionRef,
+  isPlanApprovalInteraction,
+  parsePlanRejectionSubmission,
+  type PlanApprovalInteraction,
+  type PlanApprovalMessageRef,
+} from "./plan-approval.js";
 
 let pluginCtx: PluginContext;
 let pluginToken: string;
@@ -312,6 +325,67 @@ function slackInteractionUserId(payload: Record<string, unknown>): string {
   return String(user?.id ?? "");
 }
 
+function slackInteractionMessageLocation(payload: Record<string, unknown>): {
+  channelId: string;
+  messageTs: string;
+} {
+  const container = payload.container as Record<string, unknown> | undefined;
+  const channel = payload.channel as Record<string, unknown> | undefined;
+  const message = payload.message as Record<string, unknown> | undefined;
+  return {
+    channelId: String(container?.channel_id ?? channel?.id ?? ""),
+    messageTs: String(container?.message_ts ?? message?.ts ?? ""),
+  };
+}
+
+async function markPlanApprovalResolved(
+  ctx: PluginContext,
+  interactionId: string,
+): Promise<void> {
+  await ctx.state.set(
+    {
+      scopeKind: "company",
+      scopeId: pluginCompanyId,
+      stateKey: STATE_KEYS.planApprovalResolved(interactionId),
+    },
+    true,
+  );
+}
+
+async function updateResolvedPlanApproval(
+  ctx: PluginContext,
+  ref: PlanApprovalMessageRef,
+  interaction: PlanApprovalInteraction,
+  slackUserId?: string,
+): Promise<void> {
+  const issue = await ctx.issues.get(ref.issueId, pluginCompanyId);
+  if (!issue) throw new Error(`Paperclip issue ${ref.issueId} was not found`);
+  const updated = await updateMessage(
+    ctx,
+    pluginToken,
+    ref.channelId,
+    ref.messageTs,
+    buildResolvedPlanApprovalMessage(issue, interaction, pluginConfig.paperclipBaseUrl, slackUserId),
+  );
+  if (!updated.ok) throw new Error(updated.error ?? "Could not update the Slack plan approval card");
+  await markPlanApprovalResolved(ctx, ref.interactionId);
+}
+
+async function reportPlanApprovalFailure(
+  ctx: PluginContext,
+  userId: string,
+  responseUrl: string,
+): Promise<void> {
+  const message = {
+    text: ":x: Não foi possível registrar essa decisão no Paperclip. O plano pode já ter sido alterado ou encerrado; tente novamente.",
+  };
+  if (responseUrl) {
+    await respondEphemeral(ctx, responseUrl, message);
+    return;
+  }
+  await postMessage(ctx, pluginToken, pluginConfig.slackUserId || userId, message);
+}
+
 async function handleSlackInteractivePayload(
   ctx: PluginContext,
   payload: Record<string, unknown>,
@@ -320,6 +394,90 @@ async function handleSlackInteractivePayload(
   if (!userId || (pluginConfig.slackUserId && userId !== pluginConfig.slackUserId)) {
     ctx.logger.warn("Ignoring Slack task action from an unauthorized user", { userId });
     return;
+  }
+
+  if (payload.type === "block_actions") {
+    const actions = payload.actions as Array<Record<string, unknown>> | undefined;
+    const action = actions?.[0];
+    const actionId = String(action?.action_id ?? "");
+    if (actionId !== PLAN_APPROVE_ACTION_ID && actionId !== PLAN_REJECT_ACTION_ID) return;
+
+    const ref = decodePlanApprovalActionRef(String(action?.value ?? ""));
+    const location = slackInteractionMessageLocation(payload);
+    const responseUrl = String(payload.response_url ?? "");
+    if (!ref || !location.channelId || !location.messageTs) {
+      ctx.logger.warn("Ignoring malformed Slack plan approval action", { actionId });
+      return;
+    }
+
+    if (actionId === PLAN_REJECT_ACTION_ID) {
+      const triggerId = String(payload.trigger_id ?? "");
+      if (!triggerId) return;
+      const opened = await openView(ctx, pluginToken, triggerId, buildPlanRejectionModal({
+        ...ref,
+        ...location,
+      }));
+      if (!opened.ok) {
+        await reportPlanApprovalFailure(ctx, userId, responseUrl);
+      }
+      return;
+    }
+
+    try {
+      const result = await ctx.issues.respondInteraction(
+        ref.issueId,
+        ref.interactionId,
+        {
+          action: "accept",
+          actorUserId: pluginConfig.paperclipUserId,
+        },
+        pluginCompanyId,
+      );
+      await updateResolvedPlanApproval(
+        ctx,
+        { ...ref, ...location },
+        result.interaction as unknown as PlanApprovalInteraction,
+        userId,
+      );
+      await ctx.metrics.write("slack.plan_approvals.decided", 1, { decision: "accept" });
+    } catch (err) {
+      ctx.logger.warn("Slack plan approval failed", { error: String(err), ...ref });
+      await reportPlanApprovalFailure(ctx, userId, responseUrl);
+    }
+    return;
+  }
+
+  if (payload.type === "view_submission") {
+    const view = payload.view as Record<string, unknown> | undefined;
+    if (view?.callback_id === PLAN_REJECT_MODAL_CALLBACK_ID) {
+      try {
+        const submission = parsePlanRejectionSubmission({
+          privateMetadata: String(view.private_metadata ?? ""),
+          state: (view.state ?? {}) as Parameters<typeof parsePlanRejectionSubmission>[0]["state"],
+        });
+        const result = await ctx.issues.respondInteraction(
+          submission.issueId,
+          submission.interactionId,
+          {
+            action: "reject",
+            actorUserId: pluginConfig.paperclipUserId,
+            reason: submission.reason,
+          },
+          pluginCompanyId,
+        );
+        await updateResolvedPlanApproval(
+          ctx,
+          submission,
+          result.interaction as unknown as PlanApprovalInteraction,
+          userId,
+        );
+        await ctx.metrics.write("slack.plan_approvals.decided", 1, { decision: "reject" });
+      } catch (err) {
+        ctx.logger.warn("Slack plan rejection failed", { error: String(err) });
+        await reportPlanApprovalFailure(ctx, userId, "");
+      }
+      return;
+    }
   }
 
   if (
@@ -1266,6 +1424,162 @@ const plugin = definePlugin({
     // Jobs
     // =========================================================================
 
+    ctx.jobs.register("check-pending-plan-approvals", async () => {
+      const companies = await ctx.companies.list({ limit: 100, offset: 0 });
+      for (const company of companies) {
+        const live = await getConfig(company.id);
+        // Older persisted configs predate this flag; absence means enabled so
+        // installing the upgrade immediately mirrors pending Plan reviews.
+        if (live.notifyOnPlanApproval === false) continue;
+
+        const storedRegistry = await ctx.state.get({
+          scopeKind: "company",
+          scopeId: company.id,
+          stateKey: STATE_KEYS.planApprovalRegistry,
+        });
+        const registry = Array.isArray(storedRegistry)
+          ? storedRegistry as PlanApprovalMessageRef[]
+          : [];
+
+        // First converge cards that were resolved in Paperclip instead of Slack.
+        for (const ref of registry) {
+          const alreadyResolved = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.planApprovalResolved(ref.interactionId),
+          });
+          if (alreadyResolved) continue;
+          try {
+            const [issue, interactions] = await Promise.all([
+              ctx.issues.get(ref.issueId, company.id),
+              ctx.issues.listInteractions(ref.issueId, company.id),
+            ]);
+            const interaction = interactions.find((candidate) => candidate.id === ref.interactionId);
+            if (
+              !issue
+              || !interaction
+              || interaction.status === "pending"
+              || !isPlanApprovalInteraction(interaction)
+            ) continue;
+            const updated = await updateMessage(
+              ctx,
+              token,
+              ref.channelId,
+              ref.messageTs,
+              buildResolvedPlanApprovalMessage(
+                issue,
+                interaction,
+                live.paperclipBaseUrl,
+              ),
+            );
+            if (updated.ok) {
+              await ctx.state.set(
+                {
+                  scopeKind: "company",
+                  scopeId: company.id,
+                  stateKey: STATE_KEYS.planApprovalResolved(ref.interactionId),
+                },
+                true,
+              );
+            }
+          } catch (err) {
+            ctx.logger.warn("Could not synchronize a resolved Plan approval card", {
+              error: String(err),
+              interactionId: ref.interactionId,
+            });
+          }
+        }
+
+        let offset = 0;
+        while (true) {
+          const issues = await ctx.issues.list({
+            companyId: company.id,
+            status: "in_review",
+            limit: 100,
+            offset,
+          });
+          for (const issue of issues) {
+            try {
+              const interactions = await ctx.issues.listInteractions(issue.id, company.id);
+              for (const interaction of interactions) {
+                if (
+                  interaction.status !== "pending"
+                  || !isPlanApprovalInteraction(interaction)
+                ) continue;
+
+                const storedMessage = await ctx.state.get({
+                  scopeKind: "company",
+                  scopeId: company.id,
+                  stateKey: STATE_KEYS.planApprovalMessage(interaction.id),
+                }) as PlanApprovalMessageRef | null;
+                if (storedMessage) {
+                  if (!registry.some((entry) => entry.interactionId === interaction.id)) {
+                    registry.push(storedMessage);
+                  }
+                  continue;
+                }
+
+                const linkedThread = slackThreadByIssue.get(issue.id);
+                const threadTs = linkedThread?.threadTs ?? await ctx.state.get({
+                  scopeKind: "company",
+                  scopeId: company.id,
+                  stateKey: STATE_KEYS.threadIssue(issue.id),
+                }) as string | null;
+                const channelId = linkedThread?.channelId ?? await ctx.state.get({
+                  scopeKind: "company",
+                  scopeId: company.id,
+                  stateKey: STATE_KEYS.threadIssueChannel(issue.id),
+                }) as string | null;
+                if (!threadTs || !channelId) continue;
+
+                const sent = await postMessage(
+                  ctx,
+                  token,
+                  channelId,
+                  buildPlanApprovalMessage(issue, interaction, live.paperclipBaseUrl),
+                  { threadTs },
+                );
+                if (!sent.ok || !sent.ts) continue;
+
+                const messageRef: PlanApprovalMessageRef = {
+                  issueId: issue.id,
+                  interactionId: interaction.id,
+                  channelId: sent.channel ?? channelId,
+                  messageTs: sent.ts,
+                };
+                await ctx.state.set(
+                  {
+                    scopeKind: "company",
+                    scopeId: company.id,
+                    stateKey: STATE_KEYS.planApprovalMessage(interaction.id),
+                  },
+                  messageRef,
+                );
+                registry.push(messageRef);
+                await ctx.metrics.write("slack.plan_approvals.sent", 1);
+              }
+            } catch (err) {
+              ctx.logger.warn("Could not mirror pending Plan approvals for an issue", {
+                error: String(err),
+                issueId: issue.id,
+              });
+            }
+          }
+          if (issues.length < 100) break;
+          offset += issues.length;
+        }
+
+        await ctx.state.set(
+          {
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.planApprovalRegistry,
+          },
+          registry.slice(-500),
+        );
+      }
+    });
+
     // Daily digest
     if (config.enableDailyDigest) {
       ctx.jobs.register("daily-digest", async () => {
@@ -1643,7 +1957,22 @@ const plugin = definePlugin({
       const payload = body?.payload
         ? JSON.parse(String(body.payload)) as Record<string, unknown>
         : body;
-      if (!payload || payload.type !== "block_actions") return;
+      if (!payload) return;
+
+      const planAction = payload.type === "block_actions"
+        && Array.isArray(payload.actions)
+        && [PLAN_APPROVE_ACTION_ID, PLAN_REJECT_ACTION_ID].includes(
+          String((payload.actions as Array<Record<string, unknown>>)[0]?.action_id ?? ""),
+        );
+      const view = payload.view as Record<string, unknown> | undefined;
+      const planRejectionSubmission = payload.type === "view_submission"
+        && view?.callback_id === PLAN_REJECT_MODAL_CALLBACK_ID;
+      if (planAction || planRejectionSubmission) {
+        await handleSlackInteractivePayload(pluginCtx, payload);
+        return;
+      }
+
+      if (payload.type !== "block_actions") return;
 
       const actions = payload.actions as Array<Record<string, unknown>>;
       const responseUrl = String(payload.response_url ?? "");
