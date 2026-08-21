@@ -1,5 +1,18 @@
+import { AsyncResource } from "node:async_hooks";
 import WebSocket from "ws";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+
+// This resource is created while the worker module loads, outside any
+// host-issued Paperclip invocation. WebSocket listeners are registered during
+// onConfigChanged and would otherwise retain that short-lived invocation in
+// AsyncLocalStorage. Running callbacks in this root scope lets Paperclip apply
+// the worker's configured proactive company scope instead of receiving an
+// expired invocation id.
+const proactiveSocketScope = new AsyncResource("SlackSocketModeProactiveCallback");
+
+export function runInProactiveSocketScope<T>(callback: () => T): T {
+  return proactiveSocketScope.runInAsyncScope(callback);
+}
 
 type SocketEnvelope = {
   envelope_id?: string;
@@ -62,21 +75,27 @@ export class SlackSocketModeClient {
       this.socket = socket;
 
       socket.on("open", () => {
-        this.ctx.logger.info("Slack Socket Mode connected");
+        runInProactiveSocketScope(() => {
+          this.ctx.logger.info("Slack Socket Mode connected");
+        });
       });
 
       socket.on("message", (data) => {
-        void this.handleMessage(socket, data.toString());
+        void runInProactiveSocketScope(() => this.handleMessage(socket, data.toString()));
       });
 
       socket.on("error", (err) => {
-        this.ctx.logger.warn("Slack Socket Mode connection error", { error: String(err) });
+        runInProactiveSocketScope(() => {
+          this.ctx.logger.warn("Slack Socket Mode connection error", { error: String(err) });
+        });
       });
 
       socket.on("close", () => {
-        if (this.socket === socket) this.socket = null;
-        this.ctx.logger.warn("Slack Socket Mode disconnected; reconnecting");
-        this.scheduleReconnect();
+        runInProactiveSocketScope(() => {
+          if (this.socket === socket) this.socket = null;
+          this.ctx.logger.warn("Slack Socket Mode disconnected; reconnecting");
+          this.scheduleReconnect();
+        });
       });
     } catch (err) {
       this.ctx.logger.warn("Failed to open Slack Socket Mode connection", { error: String(err) });
