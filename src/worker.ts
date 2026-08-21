@@ -592,8 +592,16 @@ async function handleSlashCommand(ctx: PluginContext, rawBody: string): Promise<
   const subcommand = parts[0]?.toLowerCase() ?? "";
   const arg = parts[1]?.toLowerCase() ?? "";
 
-  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
-  const companyId = companies[0]?.id ?? "";
+  const companies = pluginCompanyId
+    ? []
+    : await ctx.companies.list({ limit: 1, offset: 0 });
+  const companyId = pluginCompanyId || companies[0]?.id || "";
+  if (!companyId) {
+    await respondEphemeral(ctx, responseUrl, {
+      text: ":warning: Nenhuma empresa está vinculada a este comando.",
+    });
+    return;
+  }
 
   try {
     switch (subcommand) {
