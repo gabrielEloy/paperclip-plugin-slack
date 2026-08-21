@@ -64,6 +64,7 @@ let paperclipApiKey = "";
 let applyRuntimeConfig: ((config: SlackConfig, companyId: string) => Promise<void>) | null = null;
 const issueBySlackThread = new Map<string, string>();
 const handledSlackEvents = new Set<string>();
+const notifiedIssueIds = new Set<string>();
 
 // --- Slack signature verification ---
 
@@ -916,26 +917,45 @@ const plugin = definePlugin({
     // Handlers are always registered so that config changes (e.g. toggling
     // notifyOnAgentConnected) take effect without a plugin restart.
     ctx.events.on("issue.created", async (event: PluginEvent) => {
-      const live = await getConfig(event.companyId);
-      if (!live.notifyOnIssueCreated) return;
-      const result = await notify(event, formatIssueCreated);
-      if (result?.ok && result.ts) {
+      const issueId = event.entityId ?? "";
+      if (!issueId || notifiedIssueIds.has(issueId)) return;
+      notifiedIssueIds.add(issueId);
+
+      try {
+        const existingThread = await ctx.state.get({
+          scopeKind: "company",
+          scopeId: event.companyId,
+          stateKey: STATE_KEYS.threadIssue(issueId),
+        });
+        if (existingThread) return;
+
+        const live = await getConfig(event.companyId);
+        if (!live.notifyOnIssueCreated) return;
+        const result = await notify(event, formatIssueCreated);
+        if (!result?.ok || !result.ts) {
+          notifiedIssueIds.delete(issueId);
+          return;
+        }
+
         const channelId = result.channel ?? await resolveChannel(ctx, event.companyId, live.defaultChannelId);
         await ctx.state.set(
-          { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.threadIssue(event.entityId ?? "") },
+          { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.threadIssue(issueId) },
           result.ts,
         );
-        if (channelId && event.entityId) {
-          issueBySlackThread.set(`${channelId}:${result.ts}`, event.entityId);
+        if (channelId) {
+          issueBySlackThread.set(`${channelId}:${result.ts}`, issueId);
           await ctx.state.set(
-            { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.threadIssueChannel(event.entityId) },
+            { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.threadIssueChannel(issueId) },
             channelId,
           );
           await ctx.state.set(
             { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.issueForThread(channelId, result.ts) },
-            event.entityId,
+            issueId,
           );
         }
+      } catch (error) {
+        notifiedIssueIds.delete(issueId);
+        throw error;
       }
     });
 
