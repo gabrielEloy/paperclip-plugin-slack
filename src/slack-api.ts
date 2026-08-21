@@ -13,6 +13,28 @@ export interface SlackMessage {
   blocks?: Array<SlackBlock | Record<string, unknown>>;
 }
 
+export async function openView(
+  ctx: PluginContext,
+  token: string,
+  triggerId: string,
+  view: Record<string, unknown>,
+): Promise<{ ok: boolean; error?: string }> {
+  const response = await fetchWithRetry(ctx, `${SLACK_API_BASE}/views.open`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ trigger_id: triggerId, view }),
+  });
+
+  const body = await response.json() as { ok: boolean; error?: string };
+  if (!body.ok) {
+    ctx.logger.warn("Slack views.open failed", { error: body.error });
+  }
+  return body;
+}
+
 const SLACK_API_BASE = "https://slack.com/api";
 const MAX_RETRIES = 3;
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503]);

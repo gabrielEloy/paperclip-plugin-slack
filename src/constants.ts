@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-slack";
-export const PLUGIN_VERSION = "2.1.0-contadev.1";
+export const PLUGIN_VERSION = "2.1.0-contadev.2";
 
 export const WEBHOOK_KEYS = {
   slackEvents: "slack-events",

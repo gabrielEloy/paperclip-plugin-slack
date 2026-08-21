@@ -8,7 +8,7 @@ import {
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
 import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID, DEFAULT_CONFIG } from "./constants.js";
-import { postMessage, respondToAction, respondEphemeral } from "./slack-api.js";
+import { openView, postMessage, respondToAction, respondEphemeral } from "./slack-api.js";
 import type { SlackMessage } from "./slack-api.js";
 import type { SlackConfig, EscalationRecord, CommandDefinition, SessionEntry } from "./types.js";
 import { SlackAdapter } from "./adapter.js";
@@ -53,6 +53,13 @@ import {
 } from "./proactive-suggestions.js";
 import { resolveStartupSlackToken, type SlackRuntimeHealth } from "./runtime-token.js";
 import { SlackSocketModeClient, type SocketEnvelope } from "./socket-mode.js";
+import {
+  CREATE_TASK_MODAL_CALLBACK_ID,
+  CREATE_TASK_SHORTCUT_CALLBACK_ID,
+  buildCreateTaskModal,
+  parseCreateTaskSubmission,
+  type TaskFormOption,
+} from "./task-action.js";
 
 let pluginCtx: PluginContext;
 let pluginToken: string;
@@ -61,6 +68,7 @@ let slackAdapter: SlackAdapter;
 let runtimeHealth: SlackRuntimeHealth = { status: "ok" };
 let socketModeClient: SlackSocketModeClient | null = null;
 let paperclipApiKey = "";
+let pluginCompanyId = "";
 let applyRuntimeConfig: ((config: SlackConfig, companyId: string) => Promise<void>) | null = null;
 const issueBySlackThread = new Map<string, string>();
 const slackThreadByIssue = new Map<string, { channelId: string; threadTs: string }>();
@@ -240,8 +248,138 @@ async function handleSlackEventCallback(
 }
 
 async function handleSocketEnvelope(envelope: SocketEnvelope): Promise<void> {
-  if (!pluginCtx || envelope.type !== "events_api" || !envelope.payload) return;
-  await handleSlackEventCallback(pluginCtx, envelope.payload);
+  if (!pluginCtx || !envelope.payload) return;
+  if (envelope.type === "events_api") {
+    await handleSlackEventCallback(pluginCtx, envelope.payload);
+    return;
+  }
+  if (envelope.type === "interactive") {
+    await handleSlackInteractivePayload(pluginCtx, envelope.payload);
+  }
+}
+
+function paperclipUrl(path: string): string {
+  return `${pluginConfig.paperclipBaseUrl.replace(/\/$/, "")}${path}`;
+}
+
+async function paperclipRequest<T>(
+  ctx: PluginContext,
+  path: string,
+  init: RequestInit = {},
+): Promise<T> {
+  if (!paperclipApiKey || !pluginCompanyId || !pluginConfig.paperclipBaseUrl) {
+    throw new Error("Paperclip task creation is not configured");
+  }
+  const response = await ctx.http.fetch(paperclipUrl(path), {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${paperclipApiKey}`,
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...(init.headers ?? {}),
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`Paperclip request failed with HTTP ${response.status}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+async function loadTaskFormOptions(ctx: PluginContext): Promise<{
+  agents: TaskFormOption[];
+  projects: TaskFormOption[];
+}> {
+  type Agent = { id?: string; name?: string; title?: string; status?: string };
+  type Project = { id?: string; name?: string; status?: string };
+  const [agents, projects] = await Promise.all([
+    paperclipRequest<Agent[]>(ctx, `/api/companies/${pluginCompanyId}/agents`),
+    paperclipRequest<Project[]>(ctx, `/api/companies/${pluginCompanyId}/projects`),
+  ]);
+  return {
+    agents: agents
+      .filter((agent) => agent.id && agent.name && agent.status !== "terminated")
+      .map((agent) => ({
+        id: String(agent.id),
+        label: agent.title ? `${agent.name} — ${agent.title}` : String(agent.name),
+      })),
+    projects: projects
+      .filter((project) => project.id && project.name && project.status !== "cancelled")
+      .map((project) => ({ id: String(project.id), label: String(project.name) })),
+  };
+}
+
+function slackInteractionUserId(payload: Record<string, unknown>): string {
+  const user = payload.user as Record<string, unknown> | undefined;
+  return String(user?.id ?? "");
+}
+
+async function handleSlackInteractivePayload(
+  ctx: PluginContext,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  const userId = slackInteractionUserId(payload);
+  if (!userId || (pluginConfig.slackUserId && userId !== pluginConfig.slackUserId)) {
+    ctx.logger.warn("Ignoring Slack task action from an unauthorized user", { userId });
+    return;
+  }
+
+  if (
+    payload.type === "shortcut" &&
+    payload.callback_id === CREATE_TASK_SHORTCUT_CALLBACK_ID
+  ) {
+    const triggerId = String(payload.trigger_id ?? "");
+    if (!triggerId) return;
+    let options: { agents: TaskFormOption[]; projects: TaskFormOption[] } = {
+      agents: [],
+      projects: [],
+    };
+    try {
+      options = await loadTaskFormOptions(ctx);
+    } catch (err) {
+      ctx.logger.warn("Could not load Paperclip task form options", { error: String(err) });
+    }
+    const opened = await openView(ctx, pluginToken, triggerId, buildCreateTaskModal(options));
+    if (!opened.ok) throw new Error(opened.error ?? "Could not open create task modal");
+    return;
+  }
+
+  if (payload.type !== "view_submission") return;
+  const view = payload.view as Record<string, unknown> | undefined;
+  if (view?.callback_id !== CREATE_TASK_MODAL_CALLBACK_ID) return;
+
+  try {
+    const input = parseCreateTaskSubmission(
+      (view.state ?? {}) as Parameters<typeof parseCreateTaskSubmission>[0],
+    );
+    const viewId = String(view.id ?? Date.now());
+    await paperclipRequest<Record<string, unknown>>(
+      ctx,
+      `/api/companies/${pluginCompanyId}/issues`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          title: input.title,
+          description: input.description || null,
+          status: "todo",
+          priority: input.priority,
+          createdByUserId: pluginConfig.paperclipUserId,
+          responsibleUserId: pluginConfig.paperclipUserId,
+          idempotencyKey: `slack:create-task:${viewId}`,
+          ...(input.assigneeAgentId ? { assigneeAgentId: input.assigneeAgentId } : {}),
+          ...(input.projectId ? { projectId: input.projectId } : {}),
+        }),
+      },
+    );
+    try {
+      await ctx.metrics.write("slack.tasks.created", 1);
+    } catch (err) {
+      ctx.logger.warn("Could not record Slack task creation metric", { error: String(err) });
+    }
+  } catch (err) {
+    ctx.logger.warn("Slack create task action failed", { error: String(err) });
+    await postMessage(ctx, pluginToken, pluginConfig.slackUserId || userId, {
+      text: ":x: Não foi possível criar a task no Paperclip. Tente novamente.",
+    });
+  }
 }
 
 // --- Slash command routing ---
@@ -499,6 +637,7 @@ const plugin = definePlugin({
 
     applyRuntimeConfig = async (nextConfig, companyId) => {
       pluginConfig = nextConfig;
+      pluginCompanyId = companyId;
       if (nextConfig.paperclipBaseUrl) setBaseUrl(nextConfig.paperclipBaseUrl);
 
       const resolvedToken = await resolveStartupSlackToken(

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { postMessage } from "../src/slack-api.js";
+import { openView, postMessage } from "../src/slack-api.js";
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -38,5 +38,23 @@ describe("Slack direct-message delivery", () => {
     expect(fetch).toHaveBeenCalledOnce();
     const postBody = JSON.parse(fetch.mock.calls[0][1].body as string);
     expect(postBody.channel).toBe("C_TEST_CHANNEL");
+  });
+});
+
+describe("Slack modal delivery", () => {
+  it("opens a modal using the interaction trigger", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const ctx = { http: { fetch }, logger: { warn: vi.fn() } } as never;
+    const view = { type: "modal", callback_id: "paperclip_create_task_modal" };
+
+    await openView(ctx, "xoxb-test", "trigger-123", view);
+
+    expect(fetch).toHaveBeenCalledWith(
+      "https://slack.com/api/views.open",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ trigger_id: "trigger-123", view }),
+      }),
+    );
   });
 });
