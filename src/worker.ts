@@ -52,12 +52,14 @@ import {
   BUILTIN_WATCH_TEMPLATES,
 } from "./proactive-suggestions.js";
 import { resolveStartupSlackToken, type SlackRuntimeHealth } from "./runtime-token.js";
+import { SlackSocketModeClient, type SocketEnvelope } from "./socket-mode.js";
 
 let pluginCtx: PluginContext;
 let pluginToken: string;
 let pluginConfig: SlackConfig;
 let slackAdapter: SlackAdapter;
 let runtimeHealth: SlackRuntimeHealth = { status: "ok" };
+let socketModeClient: SlackSocketModeClient | null = null;
 
 // --- Slack signature verification ---
 
@@ -143,6 +145,90 @@ function statusBadge(status: string): string {
 
 function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function handleSlackEventCallback(
+  ctx: PluginContext,
+  body: Record<string, unknown>,
+): Promise<void> {
+  if (body.type !== "event_callback") return;
+
+  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+  const companyId = companies[0]?.id ?? "";
+  if (!companyId) return;
+
+  const eventId = String(body.event_id ?? "");
+  if (eventId) {
+    const eventKey = STATE_KEYS.slackEvent(eventId);
+    const alreadyHandled = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: eventKey });
+    if (alreadyHandled) return;
+    await ctx.state.set(
+      { scopeKind: "company", scopeId: companyId, stateKey: eventKey },
+      new Date().toISOString(),
+    );
+  }
+
+  const event = body.event as Record<string, unknown> | undefined;
+  if (!event) return;
+
+  if (event.type === "file_shared") {
+    const fileId = String(event.file_id ?? "");
+    const channelId = String(event.channel_id ?? "");
+    if (fileId && channelId) {
+      await processMediaFile(ctx, pluginToken, companyId, fileId, channelId, "");
+    }
+    return;
+  }
+
+  if (event.type !== "message") return;
+  if (event.bot_id || event.app_id) return;
+  const subtype = String(event.subtype ?? "");
+  if (subtype && subtype !== "file_share") return;
+
+  const channel = String(event.channel ?? "");
+  const threadTs = String(event.thread_ts ?? "");
+  const messageTs = String(event.ts ?? "");
+  const userId = String(event.user ?? "");
+  const text = String(event.text ?? "").trim();
+  const files = Array.isArray(event.files) ? event.files as Array<Record<string, unknown>> : [];
+  if (!channel || !threadTs || (!text && files.length === 0)) return;
+
+  const config = (await ctx.config.get()) as unknown as SlackConfig;
+  if (config.slackUserId && userId !== config.slackUserId) {
+    ctx.logger.warn("Ignoring Slack thread reply from an unauthorized user", { userId, channel });
+    return;
+  }
+
+  const issueId = await ctx.state.get({
+    scopeKind: "company",
+    scopeId: companyId,
+    stateKey: STATE_KEYS.issueForThread(channel, threadTs),
+  }) as string | null;
+
+  if (issueId && text) {
+    if (!config.paperclipUserId) {
+      ctx.logger.warn("Cannot relay Slack reply: paperclipUserId is not configured", { issueId });
+      return;
+    }
+    await ctx.issues.createComment(issueId, text, companyId, {
+      actorUserId: config.paperclipUserId,
+    });
+    await ctx.metrics.write("slack.issue_replies.received", 1);
+    return;
+  }
+
+  await ctx.events.emit("plugin.slack.thread_message", companyId, {
+    channel,
+    threadTs,
+    text,
+    replyToMessageTs: messageTs,
+    files,
+  });
+}
+
+async function handleSocketEnvelope(envelope: SocketEnvelope): Promise<void> {
+  if (!pluginCtx || envelope.type !== "events_api" || !envelope.payload) return;
+  await handleSlackEventCallback(pluginCtx, envelope.payload);
 }
 
 // --- Slash command routing ---
@@ -421,6 +507,21 @@ const plugin = definePlugin({
         slackSigningSecret = await ctx.secrets.resolve(config.slackSigningSecretRef);
       } catch {
         ctx.logger.warn("Slack signing secret not configured — webhook signature verification disabled");
+      }
+    }
+
+    if (config.slackAppTokenRef) {
+      try {
+        const appToken = await ctx.secrets.resolve(config.slackAppTokenRef);
+        socketModeClient = new SlackSocketModeClient(ctx, appToken, handleSocketEnvelope);
+        await socketModeClient.start();
+      } catch (err) {
+        runtimeHealth = {
+          status: "degraded",
+          message: "Slack Socket Mode could not start",
+          details: { error: String(err) },
+        };
+        ctx.logger.warn("Slack Socket Mode is unavailable", { error: String(err) });
       }
     }
 
@@ -816,11 +917,55 @@ const plugin = definePlugin({
       if (!live.notifyOnIssueCreated) return;
       const result = await notify(event, formatIssueCreated);
       if (result?.ok && result.ts) {
+        const channelId = await resolveChannel(ctx, event.companyId, config.defaultChannelId);
         await ctx.state.set(
           { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.threadIssue(event.entityId ?? "") },
           result.ts,
         );
+        if (channelId && event.entityId) {
+          await ctx.state.set(
+            { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.threadIssueChannel(event.entityId) },
+            channelId,
+          );
+          await ctx.state.set(
+            { scopeKind: "company", scopeId: event.companyId, stateKey: STATE_KEYS.issueForThread(channelId, result.ts) },
+            event.entityId,
+          );
+        }
       }
+    });
+
+    ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
+      const issueId = event.entityId ?? "";
+      const payload = event.payload as Record<string, unknown>;
+      const commentId = String(payload.commentId ?? "");
+      if (!issueId || !commentId) return;
+
+      const live = await getConfig();
+      const comments = await ctx.issues.listComments(issueId, event.companyId);
+      const comment = comments.find((candidate) => candidate.id === commentId);
+      if (!comment || comment.authorUserId === live.paperclipUserId) return;
+
+      const threadTs = await ctx.state.get({
+        scopeKind: "company",
+        scopeId: event.companyId,
+        stateKey: STATE_KEYS.threadIssue(issueId),
+      }) as string | null;
+      const channelId = await ctx.state.get({
+        scopeKind: "company",
+        scopeId: event.companyId,
+        stateKey: STATE_KEYS.threadIssueChannel(issueId),
+      }) as string | null;
+      if (!threadTs || !channelId) return;
+
+      let authorName = "Paperclip";
+      if (comment.authorAgentId) {
+        const agent = await ctx.agents.get(comment.authorAgentId, event.companyId);
+        authorName = agent?.name ?? "Paperclip agent";
+      }
+      const message = `*${authorName}:* ${comment.body}`;
+      const result = await postMessage(ctx, token, channelId, { text: message }, { threadTs });
+      if (result.ok) await ctx.metrics.write("slack.issue_comments.sent", 1);
     });
 
     ctx.events.on("issue.updated", async (event: PluginEvent) => {
@@ -1304,21 +1449,8 @@ const plugin = definePlugin({
       if (body?.type === "url_verification") {
         return;
       }
-
-      // Handle file_shared events for Phase 3 media pipeline
-      if (body?.type === "event_callback") {
-        const event = body.event as Record<string, unknown> | undefined;
-        if (event?.type === "file_shared") {
-          const companies = await pluginCtx.companies.list({ limit: 1, offset: 0 });
-          const companyId = companies[0]?.id ?? "";
-          const fileId = String(event.file_id ?? "");
-          const channelId = String(event.channel_id ?? "");
-
-          if (fileId && channelId) {
-            await processMediaFile(pluginCtx, pluginToken, companyId, fileId, channelId, "");
-          }
-        }
-      }
+      if (body) await handleSlackEventCallback(pluginCtx, body);
+      return;
     }
 
     // Slash commands
@@ -1492,7 +1624,21 @@ const plugin = definePlugin({
     if (!config.defaultChannelId || typeof config.defaultChannelId !== "string") {
       return { ok: false, errors: ["defaultChannelId is required"] };
     }
+    if (!config.slackAppTokenRef || typeof config.slackAppTokenRef !== "string") {
+      return { ok: false, errors: ["slackAppTokenRef is required for bidirectional Socket Mode"] };
+    }
+    if (!config.slackUserId || typeof config.slackUserId !== "string") {
+      return { ok: false, errors: ["slackUserId is required"] };
+    }
+    if (!config.paperclipUserId || typeof config.paperclipUserId !== "string") {
+      return { ok: false, errors: ["paperclipUserId is required"] };
+    }
     return { ok: true };
+  },
+
+  async onShutdown() {
+    await socketModeClient?.stop();
+    socketModeClient = null;
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {

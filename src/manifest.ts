@@ -21,6 +21,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "companies.read",
     "issues.read",
     "issues.create",
+    "issue.comments.read",
+    "issue.comments.create",
+    "issue.comments.create_human_attributed",
     "agents.read",
     "agent.sessions.create",
     "agent.sessions.send",
@@ -58,6 +61,25 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Slack Signing Secret (secret reference)",
         description: "Secret UUID for your Slack app's Signing Secret. Required to verify that incoming webhooks are genuinely from Slack.",
         default: DEFAULT_CONFIG.slackSigningSecretRef,
+      },
+      slackAppTokenRef: {
+        type: "string",
+        format: "secret-ref",
+        title: "Slack App Token (secret reference)",
+        description: "Secret UUID for a Slack app-level token with connections:write, used for Socket Mode.",
+        default: DEFAULT_CONFIG.slackAppTokenRef,
+      },
+      slackUserId: {
+        type: "string",
+        title: "Authorized Slack User ID",
+        description: "Only replies from this Slack user are relayed into Paperclip issues.",
+        default: DEFAULT_CONFIG.slackUserId,
+      },
+      paperclipUserId: {
+        type: "string",
+        title: "Paperclip User ID",
+        description: "Active Paperclip human member used to attribute Slack replies and wake the assigned agent.",
+        default: DEFAULT_CONFIG.paperclipUserId,
       },
       defaultChannelId: {
         type: "string",
@@ -156,7 +178,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.maxAgentsPerThread,
       },
     },
-    required: ["slackTokenRef", "slackSigningSecretRef", "defaultChannelId"],
+    required: ["slackTokenRef", "slackAppTokenRef", "slackUserId", "paperclipUserId", "defaultChannelId"],
   },
   jobs: [
     {

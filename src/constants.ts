@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-slack";
-export const PLUGIN_VERSION = "2.0.9";
+export const PLUGIN_VERSION = "2.1.0-contadev.1";
 
 export const WEBHOOK_KEYS = {
   slackEvents: "slack-events",
@@ -27,6 +27,9 @@ export const STATE_KEYS = {
   handoff: (id: string) => `handoff-${id}`,
   slackChannel: "slack-channel",
   threadIssue: (id: string) => `thread-issue-${id}`,
+  threadIssueChannel: (id: string) => `thread-issue-channel-${id}`,
+  issueForThread: (channelId: string, threadTs: string) => `issue-for-thread-${channelId}-${threadTs}`,
+  slackEvent: (eventId: string) => `slack-event-${eventId}`,
   dailyCost: (date: string) => `daily-cost-${date}`,
   dailyAgentCosts: (date: string) => `daily-agent-costs-${date}`,
   firstRunNotified: (id: string) => `first-run-notified-${id}`,
@@ -38,6 +41,9 @@ export const STATE_KEYS = {
 export const DEFAULT_CONFIG = {
   slackTokenRef: "",
   slackSigningSecretRef: "",
+  slackAppTokenRef: "",
+  slackUserId: "",
+  paperclipUserId: "",
   defaultChannelId: "",
   approvalsChannelId: "",
   errorsChannelId: "",
